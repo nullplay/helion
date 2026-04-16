@@ -31,6 +31,9 @@ from .._compiler.type_propagation import Origin
 from .._compiler.type_propagation import SequenceType
 from .._compiler.type_propagation import TensorType
 from .._compiler.type_propagation import TileIndexType
+from .._compiler.type_propagation import SparseTileType
+from .._compiler.type_propagation import SparseTensor
+from .._compiler.type_propagation import SparseTile
 from .._compiler.type_propagation import TypeInfo
 from .._compiler.variable_origin import GetItemOrigin
 from ..autotuner.config_spec import ConfigSpec
@@ -54,7 +57,7 @@ if TYPE_CHECKING:
     from .constexpr import ConstExpr
 
 
-__all__ = ["grid", "jagged_tile", "static_range", "tile"]
+__all__ = ["grid", "jagged_tile", "sparse_tile", "static_range", "tile"]
 
 
 @overload
@@ -757,6 +760,47 @@ def _(
 def _(state: CodegenState) -> ast.AST:
     raise exc.NotInsideKernel
 
+
+@_decorators.api(
+    is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
+)
+def sparse_tile(
+    parent: object,
+) -> Iterator[Tile]:
+    raise exc.NotInsideKernel
+
+@_decorators.type_propagation(sparse_tile)
+def _(
+    parent: TypeInfo,
+    *,
+    dim: TypeInfo,
+    levelformat: TypeInfo,
+    origin: Origin,
+) -> TypeInfo:
+    lvlfmt = levelformat.as_literal()
+
+    if isinstance(parent, SparseTensorType):
+        root_level_shape = parent.shape[dim.as_literal()]
+        base = TileIndexType.allocate(root_level_shape, origin)
+        return IterType(origin, SparseTileType(
+            outer_block_id = base.block_id,
+            inner_block_id = None,
+            is_jagged = False,
+            sparse_tensor = parent,
+            levelformat = lvlfmt,
+        ))
+
+    elif isinstance(parent, SparseTileType):
+        if lvlfmt in ("Compressed", "Jagged"):
+            inner_type = JaggedTileIndexType.allocate(origin, parent.outer_block_id)
+
+        return IterType(origin, SparseTileType(
+            outer_block_id = parent.outer_block_id,
+            inner_block_id = inner_type.block_id,
+            is_jagged = True,
+            sparse_tensor = parent.sparse_tensor,
+            levelformat = lvlfmt
+        ))
 
 def _codegen_loop_helper(
     state: CodegenState,

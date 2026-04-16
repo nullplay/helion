@@ -1263,6 +1263,24 @@ class IterType(TypeInfo):
     def propagate_iter(self, origin: Origin) -> TypeInfo:
         return self.inner
 
+class SparseTileType(TypeInfo):
+    outer_block_id: int
+    inner_block_id: int | None
+    is_jagged: bool
+    sparse_tensor: SparseTensor
+    levelformat: str
+
+    def propagate_attribute(self, attr, origin):
+        if attr = "sparse_tile":
+            return CallableType(origin, hl.sparse_tile)
+
+class SparseTensor:
+    def sparse_tile(self, dim: int, levelformat: str):
+        return hl.sparse_tile(self, dim=dim, levelformat=levelformat)
+
+class SparseTile:
+    def sparse_tile(self, dim: int, levelformat: str):
+        return hl.sparse_tile(self, dim=dim, levelformat=levelformat)
 
 class NoType(TypeInfo):
     """Used for AST nodes like Store() where a type is not applicable."""
