@@ -198,6 +198,20 @@ class TypeInfo:
 
     @classmethod
     def from_example(cls, value: object, origin: Origin) -> TypeInfo:
+        from ..language.sparse_tensor import SparseTensor 
+
+        if isinstance(value, SparseTensor):
+            keys = list(value.__dataclass_fields__.keys())
+            element_types = dict(
+                zip(
+                    keys,
+                    cls._unpack_example(
+                        [(k, getattr(value, k)) for k in keys], origin
+                    ),
+                    strict=False,
+                )
+            )
+            return SparseTensorType(origin, element_types)
         if isinstance(value, torch.Tensor):
             # TODO(jansel): need to wrap this in a fake tensor
             # TODO(jansel): tensor subclass support
@@ -510,6 +524,13 @@ class TensorType(TypeInfo):
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
                 output_sizes.append(env.block_sizes[k.block_id].var)
+            elif isinstance(k, SparseTileType):
+                # Multi-dim sparse tile index: consumes 1 input dim, contributes
+                # one output dim per level (e.g. [P0, P1] for a 2-level tile).
+                inputs_consumed += 1
+                output_sizes.extend(
+                    [env.block_sizes[bid].var for bid in k._block_ids]
+                )
             elif isinstance(k, TensorType) and k.fake_value.dtype == torch.bool:
                 raise exc.DataDependentOutputShapeNotSupported(
                     op_desc="Boolean mask indexing (tensor[boolean_mask])"
@@ -910,6 +931,7 @@ class CallableType(LiteralType):
             raise
         except Exception as e:
             # TODO(jansel): point to other tracing modes
+            breakpoint()
             raise exc.TorchOpTracingError(e) from e
 
     @staticmethod
@@ -1263,24 +1285,6 @@ class IterType(TypeInfo):
     def propagate_iter(self, origin: Origin) -> TypeInfo:
         return self.inner
 
-class SparseTileType(TypeInfo):
-    outer_block_id: int
-    inner_block_id: int | None
-    is_jagged: bool
-    sparse_tensor: SparseTensor
-    levelformat: str
-
-    def propagate_attribute(self, attr, origin):
-        if attr = "sparse_tile":
-            return CallableType(origin, hl.sparse_tile)
-
-class SparseTensor:
-    def sparse_tile(self, dim: int, levelformat: str):
-        return hl.sparse_tile(self, dim=dim, levelformat=levelformat)
-
-class SparseTile:
-    def sparse_tile(self, dim: int, levelformat: str):
-        return hl.sparse_tile(self, dim=dim, levelformat=levelformat)
 
 class NoType(TypeInfo):
     """Used for AST nodes like Store() where a type is not applicable."""
@@ -1558,6 +1562,118 @@ class StackTensorType(ClassType):
             .proxy()
             .new_empty(self._device_indexing_size(key)),
         )
+
+class SparseTensorType(ClassType):
+    """Type for ``SparseTensor`` kernel arguments.
+
+    The ptr/coord/values FakeTensors live in ``element_types`` so they are
+    automatically registered in ``HostFunction.tensor_to_origin`` via
+    ``DictType.populate_symbol_origins``.  Internal compiler code can read them
+    through ``element_types[...]``; user code cannot, because we override
+    ``propagate_attribute`` to allow only ``shape``.
+    """
+
+    def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
+        if attr == "shape":
+            return super().propagate_attribute(attr, origin)
+        raise exc.TypeInferenceError(
+            f"SparseTensor exposes only `.shape` to user code; got `.{attr}`."
+            " Use `hl.sparse_tile(...)` to iterate over the sparse structure."
+        )
+
+
+class SparseTileType(TensorType):
+    """Type for the loop variable produced by ``hl.sparse_tile``.
+
+    Subtype of :class:`TensorType`: the ``fake_value`` is a rank-``depth``
+    integer tensor representing the coordinates at this tile level (e.g.
+    ``[P0]`` at the root, ``[P0, P1]`` one level down).  Derived operations
+    (``tile + 1``, ``tile.to(...)``, slicing, etc.) fall through to
+    :class:`TensorType` and return plain :class:`TensorType`, so any derivation
+    naturally loses the sparse-tile identity — which is exactly what
+    ``hl.sparse_tile(parent_tile, ...)`` relies on to enforce "child source
+    must be an unmodified tile".
+
+    The per-level ``off``/``coord``/``values_ref`` FakeTensors are **not**
+    stored on the type: they are populated in ``CompileEnvironment.sparse_tile_meta``
+    (keyed by ``tuple(_block_ids)``) as the loop is entered in device IR.
+    """
+
+    _sparse_tensor_type: SparseTensorType
+    _levelformat: str
+    _block_ids: list[int]
+    _dim: int
+
+    def __init__(
+        self,
+        origin: Origin,
+        sparse_tensor_type: SparseTensorType,
+        levelformat: str,
+        block_ids: list[int],
+        dim: int,
+    ) -> None:
+        env = CompileEnvironment.current()
+        coord_t = sparse_tensor_type.element_types["coord"]
+        assert isinstance(coord_t, TensorType)
+        shape = [env.block_sizes[bid].var for bid in block_ids]
+        fake_value = coord_t.fake_value.new_empty(shape)
+        super().__init__(origin, fake_value)
+        self._sparse_tensor_type = sparse_tensor_type
+        self._levelformat = levelformat
+        self._block_ids = block_ids
+        self._dim = dim
+
+    @property
+    def depth(self) -> int:
+        return len(self._block_ids)
+
+    @property
+    def is_leaf(self) -> bool:
+        shape_type = self._sparse_tensor_type.element_types["shape"]
+        assert isinstance(shape_type, SequenceType)
+        return self._dim == len(shape_type.element_types) - 1
+
+    def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
+        if attr == "value":
+            if not self.is_leaf:
+                shape_type = self._sparse_tensor_type.element_types["shape"]
+                assert isinstance(shape_type, SequenceType)
+                ndim = len(shape_type.element_types)
+                raise exc.TypeInferenceError(
+                    f"tile.value is only available on the leaf sparse tile"
+                    f" (dim={ndim - 1}); this tile is at dim={self._dim}."
+                )
+            values_t = self._sparse_tensor_type.element_types["values"]
+            assert isinstance(values_t, TensorType)
+            fake = values_t.fake_value.new_empty(self.fake_value.shape)
+            return TensorType(origin, fake)
+        return super().propagate_attribute(attr, origin)
+
+    def proxy(self) -> object:
+        if self.depth == 1:
+            # Root tile: act as an iteration handle (like ``hl.tile``) so
+            # ``_tiles_to_sizes([tile_m]) → [P0_sym]`` works for shape args.
+            with proxy_tensor.disable_proxy_modes_tracing():
+                fake_mode = torch._C._unset_dispatch_mode(
+                    torch._C._TorchDispatchModeKey.FAKE
+                )
+                try:
+                    with torch._C._DisableTorchDispatch():
+                        return Tile(self._block_ids[0])
+                finally:
+                    assert fake_mode is not None
+                    torch._C._set_dispatch_mode(fake_mode)
+        # Nested: scope binding is done directly by ``_visit_sparse_tile`` in
+        # device IR using the real traced coord FakeTensor.  This fallback
+        # returns the shape-correct placeholder so anything that inspects it
+        # (shape/dtype) stays sane.
+        return super().proxy()
+
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
+        if isinstance(other, SparseTileType) and self._block_ids == other._block_ids:
+            return self
+        return TypeInfo.merge(self, other, var_name=var_name)
+
 
 
 class SliceType(CollectionType):

@@ -165,6 +165,7 @@ class CompileEnvironment:
         self.specialized_strides: set[tuple[str, int]] = set()
         self.jagged_tile_parent_id: dict[int, int] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
+        self.sparse_tile_meta: dict[tuple[int, ...], SparseTileMeta] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
         self._foreign_symint_cache: dict[tuple[int, sympy.Expr], torch.SymInt] = {}
         self.device_load_count = (
@@ -1033,6 +1034,26 @@ class NoCurrentEnvironment(RuntimeError):
 
 class AutoSize:
     """A marker used to delay setting the size of a block until it is known."""
+
+
+@dataclasses.dataclass
+class SparseTileMeta:
+    """Sidecar metadata for a traced ``SparseTile``.
+
+    Keyed by ``tuple(SparseTileType._block_ids)`` on
+    ``CompileEnvironment.sparse_tile_meta``.  Populated when a
+    ``hl.sparse_tile(...)`` loop is entered in device IR so that:
+
+    * the child level can index ``ptr_{k+1}[off_k]`` without caring whether the
+      parent is a root tile or a nested one;
+    * the leaf's ``tile.value`` attribute can expand to
+      ``hl.load(values_ref_fake, [off_fake])``.
+    """
+
+    off_fake: torch.Tensor
+    coord_fake: torch.Tensor
+    values_ref_fake: torch.Tensor
+    parent_block_ids: tuple[int, ...] | None
 
 
 @dataclasses.dataclass

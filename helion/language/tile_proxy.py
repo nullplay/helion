@@ -167,3 +167,5 @@ class _CheckForIndexCalls:
 
     def __exit__(self, *args: object) -> None:
         _tls.index_calls = None
+
+

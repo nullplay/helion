@@ -24,8 +24,10 @@ from .inline_triton_ops import inline_triton as inline_triton
 from .inline_triton_ops import triton_kernel as triton_kernel
 from .loops import grid as grid
 from .loops import jagged_tile as jagged_tile
+from .loops import sparse_tile as sparse_tile
 from .loops import static_range as static_range
 from .loops import tile as tile
+from .sparse_tensor import SparseTensor as SparseTensor
 from .matmul_ops import dot as dot
 from .matmul_ops import dot_scaled as dot_scaled
 from .memory_ops import load as load

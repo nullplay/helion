@@ -31,9 +31,8 @@ from .._compiler.type_propagation import Origin
 from .._compiler.type_propagation import SequenceType
 from .._compiler.type_propagation import TensorType
 from .._compiler.type_propagation import TileIndexType
+from .._compiler.type_propagation import SparseTensorType
 from .._compiler.type_propagation import SparseTileType
-from .._compiler.type_propagation import SparseTensor
-from .._compiler.type_propagation import SparseTile
 from .._compiler.type_propagation import TypeInfo
 from .._compiler.variable_origin import GetItemOrigin
 from ..autotuner.config_spec import ConfigSpec
@@ -765,42 +764,86 @@ def _(state: CodegenState) -> ast.AST:
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def sparse_tile(
-    parent: object,
+    source: object,
+    *,
+    dim: int,
+    levelformat: str,
 ) -> Iterator[Tile]:
+    """Iterate over tiles of a sparse tensor level.
+
+    ``source`` is either a :class:`SparseTensor` (for the root level) or the
+    outer :class:`SparseTile` returned by a prior ``hl.sparse_tile`` call (for
+    nested levels).  Each call appends one block ID to the resulting tile, so
+    rank grows with depth: ``[P0]`` at the root, ``[P0, P1]`` one level down.
+    """
     raise exc.NotInsideKernel
+
+
+def _sparse_tile_propagation(
+    source: SparseTensorType | SparseTileType,
+    dim_val: int,
+    lvlfmt: str,
+    origin: Origin,
+) -> TypeInfo:
+    env = CompileEnvironment.current()
+
+    if isinstance(source, SparseTensorType):
+        sparse_tt = source
+        parent_block_ids: list[int] = []
+    else:
+        assert isinstance(source, SparseTileType)
+        sparse_tt = source._sparse_tensor_type
+        parent_block_ids = list(source._block_ids)
+
+    # ptr fake gives the source tensor's logical shape via its element_types.
+    # For N-D CSF there will be one ``ptr`` / ``coord`` array per compressed
+    # level; we only handle 2-D CSR (single ptr/coord) for now.
+    shape_for_dim = sparse_tt.element_types["ptr"].fake_value.size(0) - 1  # type: ignore[union-attr]
+
+    if lvlfmt in ("Compressed", "Jagged"):
+        inner = TileIndexType.allocate(None, origin)
+        if parent_block_ids:
+            env.register_jagged_tile(inner.block_id, parent_block_ids[-1])
+        _add_config_choices(
+            [inner.block_id],
+            is_tile=True,
+            allow_static_ranges=[False],
+            has_data_dependent_bounds=True,
+        )
+    else:  # Dense, Padded — fixed bound from the tensor shape
+        inner = TileIndexType.allocate(shape_for_dim, origin)
+        _add_config_choices(
+            [inner.block_id], is_tile=True, allow_static_ranges=[False]
+        )
+
+    block_ids = [*parent_block_ids, inner.block_id]
+    return IterType(
+        origin,
+        SparseTileType(origin, sparse_tt, lvlfmt, block_ids, dim_val),
+    )
+
 
 @_decorators.type_propagation(sparse_tile)
 def _(
-    parent: TypeInfo,
+    source: TypeInfo,
     *,
     dim: TypeInfo,
     levelformat: TypeInfo,
     origin: Origin,
 ) -> TypeInfo:
-    lvlfmt = levelformat.as_literal()
+    if not isinstance(source, (SparseTensorType, SparseTileType)):
+        raise exc.TypeInferenceError(
+            f"hl.sparse_tile: expected SparseTensor or SparseTile as first arg, got {source!s}"
+        )
+    return _sparse_tile_propagation(
+        source, dim.as_literal(), levelformat.as_literal(), origin
+    )
 
-    if isinstance(parent, SparseTensorType):
-        root_level_shape = parent.shape[dim.as_literal()]
-        base = TileIndexType.allocate(root_level_shape, origin)
-        return IterType(origin, SparseTileType(
-            outer_block_id = base.block_id,
-            inner_block_id = None,
-            is_jagged = False,
-            sparse_tensor = parent,
-            levelformat = lvlfmt,
-        ))
 
-    elif isinstance(parent, SparseTileType):
-        if lvlfmt in ("Compressed", "Jagged"):
-            inner_type = JaggedTileIndexType.allocate(origin, parent.outer_block_id)
+@_decorators.codegen(sparse_tile, "common")
+def _(state: CodegenState) -> ast.AST:
+    raise exc.NotInsideKernel
 
-        return IterType(origin, SparseTileType(
-            outer_block_id = parent.outer_block_id,
-            inner_block_id = inner_type.block_id,
-            is_jagged = True,
-            sparse_tensor = parent.sparse_tensor,
-            levelformat = lvlfmt
-        ))
 
 def _codegen_loop_helper(
     state: CodegenState,
