@@ -202,15 +202,10 @@ class TypeInfo:
 
         if isinstance(value, SparseTensor):
             keys = list(value.__dataclass_fields__.keys())
-            element_types = dict(
-                zip(
-                    keys,
-                    cls._unpack_example(
-                        [(k, getattr(value, k)) for k in keys], origin
-                    ),
-                    strict=False,
-                )
-            )
+            element_types = {
+                k: cls.from_example(getattr(value, k), AttributeOrigin(origin, k))
+                for k in keys
+            }
             return SparseTensorType(origin, element_types)
         if isinstance(value, torch.Tensor):
             # TODO(jansel): need to wrap this in a fake tensor
@@ -1581,22 +1576,26 @@ class SparseTensorType(ClassType):
             " Use `hl.sparse_tile(...)` to iterate over the sparse structure."
         )
 
+    def populate_symbol_origins(self, origin: Origin) -> None:
+        for k, subtype in self.element_types.items():
+            subtype.populate_symbol_origins(AttributeOrigin(origin, k))
+
 
 class SparseTileType(TensorType):
     """Type for the loop variable produced by ``hl.sparse_tile``.
 
     Subtype of :class:`TensorType`: the ``fake_value`` is a rank-``depth``
-    integer tensor representing the coordinates at this tile level (e.g.
-    ``[P0]`` at the root, ``[P0, P1]`` one level down).  Derived operations
+    integer coordinate tensor at this tile level (e.g. ``[P0]`` at the
+    root, ``[P0, P1]`` one level down).  Derived operations
     (``tile + 1``, ``tile.to(...)``, slicing, etc.) fall through to
-    :class:`TensorType` and return plain :class:`TensorType`, so any derivation
-    naturally loses the sparse-tile identity — which is exactly what
-    ``hl.sparse_tile(parent_tile, ...)`` relies on to enforce "child source
-    must be an unmodified tile".
+    :class:`TensorType` and return plain :class:`TensorType`, so any
+    derivation naturally loses the sparse-tile identity — which is
+    exactly what ``hl.sparse_tile(parent_tile, ...)`` relies on to
+    enforce "child source must be an unmodified tile".
 
-    The per-level ``off``/``coord``/``values_ref`` FakeTensors are **not**
-    stored on the type: they are populated in ``CompileEnvironment.sparse_tile_meta``
-    (keyed by ``tuple(_block_ids)``) as the loop is entered in device IR.
+    The per-level ``position`` FakeTensor is **not** stored here: it is
+    published in ``CompileEnvironment.sparse_tile_position`` (keyed by
+    this level's own ``block_id``) as the loop is entered in device IR.
     """
 
     _sparse_tensor_type: SparseTensorType
@@ -1613,10 +1612,21 @@ class SparseTileType(TensorType):
         dim: int,
     ) -> None:
         env = CompileEnvironment.current()
-        coord_t = sparse_tensor_type.element_types["coord"]
-        assert isinstance(coord_t, TensorType)
         shape = [env.block_sizes[bid].var for bid in block_ids]
-        fake_value = coord_t.fake_value.new_empty(shape)
+        # tile_k is a coordinate — int64 on the kernel device.  If the
+        # tensor has any Compressed level we inherit dtype/device from its
+        # first non-None coord slot; pure-Dense tensors synthesize from
+        # env.device (all coord slots are None).
+        coords_seq = sparse_tensor_type.element_types["coords"]
+        assert isinstance(coords_seq, SequenceType)
+        coord_t = next(
+            (t for t in coords_seq.element_types if isinstance(t, TensorType)),
+            None,
+        )
+        if coord_t is not None:
+            fake_value = coord_t.fake_value.new_empty(shape)
+        else:
+            fake_value = torch.empty(shape, dtype=torch.int64, device=env.device)
         super().__init__(origin, fake_value)
         self._sparse_tensor_type = sparse_tensor_type
         self._levelformat = levelformat
@@ -1624,14 +1634,10 @@ class SparseTileType(TensorType):
         self._dim = dim
 
     @property
-    def depth(self) -> int:
-        return len(self._block_ids)
-
-    @property
     def is_leaf(self) -> bool:
         shape_type = self._sparse_tensor_type.element_types["shape"]
         assert isinstance(shape_type, SequenceType)
-        return self._dim == len(shape_type.element_types) - 1
+        return len(self._block_ids) == len(shape_type.element_types)
 
     def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
         if attr == "value":
@@ -1641,7 +1647,7 @@ class SparseTileType(TensorType):
                 ndim = len(shape_type.element_types)
                 raise exc.TypeInferenceError(
                     f"tile.value is only available on the leaf sparse tile"
-                    f" (dim={ndim - 1}); this tile is at dim={self._dim}."
+                    f" (depth={ndim}); this tile is at depth={len(self._block_ids)}."
                 )
             values_t = self._sparse_tensor_type.element_types["values"]
             assert isinstance(values_t, TensorType)
@@ -1650,7 +1656,7 @@ class SparseTileType(TensorType):
         return super().propagate_attribute(attr, origin)
 
     def proxy(self) -> object:
-        if self.depth == 1:
+        if len(self._block_ids) == 1:
             # Root tile: act as an iteration handle (like ``hl.tile``) so
             # ``_tiles_to_sizes([tile_m]) → [P0_sym]`` works for shape args.
             with proxy_tensor.disable_proxy_modes_tracing():

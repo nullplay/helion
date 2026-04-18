@@ -795,11 +795,6 @@ def _sparse_tile_propagation(
         sparse_tt = source._sparse_tensor_type
         parent_block_ids = list(source._block_ids)
 
-    # ptr fake gives the source tensor's logical shape via its element_types.
-    # For N-D CSF there will be one ``ptr`` / ``coord`` array per compressed
-    # level; we only handle 2-D CSR (single ptr/coord) for now.
-    shape_for_dim = sparse_tt.element_types["ptr"].fake_value.size(0) - 1  # type: ignore[union-attr]
-
     if lvlfmt in ("Compressed", "Jagged"):
         inner = TileIndexType.allocate(None, origin)
         if parent_block_ids:
@@ -810,7 +805,12 @@ def _sparse_tile_propagation(
             allow_static_ranges=[False],
             has_data_dependent_bounds=True,
         )
-    else:  # Dense, Padded — fixed bound from the tensor shape
+    else:  # Dense — fixed bound from the tensor's shape[dim_val]
+        shape_seq = sparse_tt.element_types["shape"]
+        assert isinstance(shape_seq, SequenceType), (
+            "SparseTensor.shape must propagate as a SequenceType"
+        )
+        shape_for_dim = shape_seq.element_types[dim_val].proxy()
         inner = TileIndexType.allocate(shape_for_dim, origin)
         _add_config_choices(
             [inner.block_id], is_tile=True, allow_static_ranges=[False]
@@ -842,7 +842,36 @@ def _(
 
 @_decorators.codegen(sparse_tile, "common")
 def _(state: CodegenState) -> ast.AST:
-    raise exc.NotInsideKernel
+    """Codegen for the outer (GRID) ``hl.sparse_tile`` loop.
+
+    Inner levels are already desugared inside device IR into ``_for_loop``
+    subgraphs (see ``_lower_dense_level`` / ``_lower_compressed_level``),
+    so this codegen only runs for the outermost root level — which is
+    required to be ``"Dense"`` (see ``_register_root_sparse_position``).
+    Emits a grid launch over ``[0, shape[dim])`` by rewriting
+    ``state.proxy_args`` into the ``(end, None, None)`` shape that
+    ``codegen_grid`` expects from ``hl.tile(N)``.
+    """
+    for_loop = ExtendedAST.current()[-2]
+    assert isinstance(for_loop, ast.For)
+    loop_type = for_loop._loop_type
+    type_info = ExtendedAST.current()[-1]._type_info
+    assert isinstance(type_info, IterType)
+    inner = type_info.inner
+    assert isinstance(inner, SparseTileType)
+    assert loop_type == LoopType.GRID, (
+        f"inner sparse_tile loops are desugared in device IR; got {loop_type!r}"
+    )
+    assert inner._levelformat == "Dense", (
+        "hl.sparse_tile at the root (GRID) level must be Dense; got"
+        f" levelformat={inner._levelformat!r}"
+    )
+    shape_seq = inner._sparse_tensor_type.element_types["shape"]
+    assert isinstance(shape_seq, SequenceType)
+    size_d = shape_seq.element_types[inner._dim].proxy()
+    state.proxy_args[:] = [size_d, None, None]
+    state.tile_strategy.codegen_grid(state, inner._block_ids)
+    return expr_from_string("None")
 
 
 def _codegen_loop_helper(

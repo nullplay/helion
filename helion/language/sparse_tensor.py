@@ -5,27 +5,30 @@ import dataclasses
 import torch
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(eq=False)
 class SparseTensor:
     """A sparse tensor described level-by-level.
 
-    Holds the three standard arrays (ptr, coord, values) and the logical shape.
-    Level formats (Dense, Compressed, Jagged, Padded) are specified at call time
-    via ``sparse_tile``.
+    Storage is uniform across formats:
 
-    Example::
+    * ``values`` is always a flat 1-D tensor of length ``nnz`` (the total
+      number of leaf positions). The way to turn a user-visible multi-axis
+      value into a flat position is determined by the per-level lowering,
+      so the same flat array works for DD / DC / CD / CC / ... .
+    * ``shape`` is positional: ``shape[d]`` is the size of dim ``d``.
+    * ``ptrs`` / ``coords`` have length ``len(shape)`` and are aligned to
+      **tensor level order** (outer → inner in the user's
+      ``hl.sparse_tile`` loop nest). Compressed levels store their
+      ``ptr`` / ``coord`` tensor; Dense levels store ``None``.
 
-        ptr   = torch.tensor([0, 2, 3, 5], device="cuda")   # 3 rows, 5 nnz
-        coord = torch.tensor([0, 2, 1, 0, 3], device="cuda")
-        val   = torch.tensor([1., 2., 3., 4., 5.], device="cuda")
-        A = hl.SparseTensor(ptr=ptr, coord=coord, values=val, shape=(3, 4))
-
-    Iteration is expressed with ``hl.sparse_tile(source, dim=..., levelformat=...)``,
-    where ``source`` is either this tensor (for the root level) or an outer
-    ``SparseTile`` produced by a previous ``hl.sparse_tile`` call.
+    The per-level format (Dense / Compressed) is given at the call site
+    via ``hl.sparse_tile(..., levelformat=...)`` — it is not stored on
+    the tensor. The tensor just supplies whatever arrays the chosen
+    formats need.
     """
 
-    ptr: torch.Tensor  # [n0+1]  position / row-pointer array
-    coord: torch.Tensor  # [nnz]   coordinate (column-index) array
-    values: torch.Tensor  # [nnz]  nonzero values
+    values: torch.Tensor  # flat, length nnz
     shape: tuple[int, ...]
+    # length == len(shape); None for Dense levels, tensor for Compressed.
+    ptrs: tuple[torch.Tensor | None, ...] = ()
+    coords: tuple[torch.Tensor | None, ...] = ()

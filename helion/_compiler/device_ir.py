@@ -45,7 +45,6 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
-from .compile_environment import SparseTileMeta
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
@@ -933,56 +932,149 @@ class WalkDeviceAST(NodeVisitor):
     def _visit_sparse_tile(
         self, node: ast.For, inner_type: SparseTileType
     ) -> None:
-        """Desugar ``hl.sparse_tile(parent, ..., levelformat="Compressed")``
-        into the same machinery used by ``hl.jagged_tile``.
+        """Dispatch per-level sparse_tile lowering.
 
-        Generalizes to N-D by looking up the parent's ``off`` tensor in
-        ``CompileEnvironment.sparse_tile_meta``; when the parent is a plain
-        root tile (not registered), its ``off`` is just ``hl.tile_index``.
-
-        After tracing the loop body, ``(off_k, crd_k, values_ref)`` for this
-        level are recorded in ``env.sparse_tile_meta`` so that
-        ``tile_k.value`` (AST-level dispatch in :meth:`visit_Attribute`) and
-        any nested ``hl.sparse_tile(tile_k, ...)`` can descend.
+        Every level is lowered independently by format. A level only
+        consumes its parent's ``position`` tensor (flat index into
+        ``values``) and publishes its own ``position``; root-ness is a
+        1-line ternary inside each helper.
         """
-        assert inner_type._levelformat == "Compressed", (
-            "only Compressed sparse_tile is currently supported; "
+        fmt = inner_type._levelformat
+        if fmt == "Dense":
+            self._lower_dense_level(node, inner_type)
+        elif fmt == "Compressed":
+            self._lower_compressed_level(node, inner_type)
+        else:
+            raise AssertionError(
+                f"hl.sparse_tile: unsupported levelformat {fmt!r}"
+            )
+
+    def _register_root_sparse_position(
+        self, inner_type: SparseTileType
+    ) -> None:
+        """Publish the root sparse level's flat ``position`` so inner levels
+        can find it in ``env.sparse_tile_position``.
+
+        The root loop runs at GRID scope (no ``_for_loop`` subgraph), so
+        we register its position inline. Only Dense root is supported for
+        now: ``position = hl.tile_index(outer_sym)``.
+        """
+        assert inner_type._levelformat == "Dense", (
+            "hl.sparse_tile at the root (GRID) level must be Dense; "
             f"got levelformat={inner_type._levelformat!r}"
         )
-        assert len(inner_type._block_ids) >= 2
-        *parent_ids, current_bid = inner_type._block_ids
-        sparse_tt = inner_type._sparse_tensor_type
-        ptr_fake = cast(
-            "TensorType", sparse_tt.element_types["ptr"]
-        ).fake_value
-        coord_fake = cast(
-            "TensorType", sparse_tt.element_types["coord"]
-        ).fake_value
-        values_fake = cast(
-            "TensorType", sparse_tt.element_types["values"]
-        ).fake_value
-
         env = CompileEnvironment.current()
-        parent_key = tuple(parent_ids)
-        if parent_key in env.sparse_tile_meta:
-            parent_off = env.sparse_tile_meta[parent_key].off_fake
-        else:
-            # Parent is a plain root tile (e.g. ``hl.tile``): its "off" into
-            # ``ptr`` is just its coordinate.
-            assert len(parent_ids) == 1, (
-                "nested sparse_tile expects the parent tile's meta to be"
-                f" registered; parent_ids={parent_ids} not found"
-            )
-            parent_off = hl.tile_index(env.block_sizes[parent_ids[0]].var)
+        bids = inner_type._block_ids
+        assert len(bids) == 1
+        current_bid = bids[-1]
+        inner_sym = env.block_sizes[current_bid].var
+        env.sparse_tile_position[current_bid] = hl.tile_index(inner_sym)
 
-        # Compute lengths in the OUTER graph context (traced inline).
-        start = hl.load(ptr_fake, [parent_off])
-        end_ptr = hl.load(ptr_fake, [parent_off + 1])
+    def _sparse_parent_position(
+        self, inner_type: SparseTileType
+    ) -> torch.Tensor | int:
+        """Return the parent level's flat `position` into `values`.
+
+        At the root (single block_id) the parent is synthetic and its
+        position is scalar ``0``; otherwise it is the position published
+        by the enclosing level into ``env.sparse_tile_position``.
+        """
+        env = CompileEnvironment.current()
+        bids = inner_type._block_ids
+        if len(bids) == 1:
+            return 0
+        return env.sparse_tile_position[bids[-2]]
+
+    def _lower_dense_level(
+        self, node: ast.For, inner_type: SparseTileType
+    ) -> None:
+        env = CompileEnvironment.current()
+        bids = inner_type._block_ids
+        current_bid = bids[-1]
+        parent_pos = self._sparse_parent_position(inner_type)
+
+        sparse_tt = inner_type._sparse_tensor_type
+        shape_seq = sparse_tt.element_types["shape"]
+        assert isinstance(shape_seq, SequenceType)
+        size_d = shape_seq.element_types[inner_type._dim].proxy()
+
+        rw: ReadWrites = ReadWrites.from_ast(node)
+        inputs_dict: dict[str, object] = {}
+        if isinstance(parent_pos, torch.Tensor):
+            inputs_dict["__sparse_parent_position"] = parent_pos
+        for name in self._rw_names(rw):
+            if (
+                name in self.scope
+                and self.should_become_arg(self.scope[name])
+                and name not in inputs_dict
+            ):
+                inputs_dict[name] = self.scope[name]
+        inputs = LiftTensorArgs(inputs_dict)
+
+        inner_sym = env.block_sizes[current_bid].var
+
+        def build_subgraph(
+            subgraph_walker: WalkDeviceAST,
+        ) -> tuple[list[object], LiftTensorArgs]:
+            inner_tile = hl.tile_index(inner_sym)
+            if isinstance(parent_pos, torch.Tensor):
+                parent_ph = subgraph_walker.scope["__sparse_parent_position"]
+                assert isinstance(parent_ph, torch.Tensor)
+                # parent_ph has shape (P0, ..., P_{k-1}); broadcast a trailing
+                # axis with inner_tile (shape (P_k,)) to get (..., P_k).
+                self_position = parent_ph.unsqueeze(-1) * size_d + inner_tile
+            else:
+                # root: parent_pos is scalar 0 -> self_position == inner_tile
+                self_position = inner_tile
+            env.sparse_tile_position[current_bid] = self_position
+            subgraph_walker._assign(node.target, inner_tile)
+            subgraph_walker._body(node.body)
+            loop_outputs = self._collect_outputs(
+                subgraph_walker.scope, rw.writes
+            )
+            return loop_outputs.get_tensor_args(), loop_outputs
+
+        self._finish_sparse_loop(
+            inputs, build_subgraph, current_bid, begin=0, end=size_d
+        )
+
+    def _lower_compressed_level(
+        self, node: ast.For, inner_type: SparseTileType
+    ) -> None:
+        env = CompileEnvironment.current()
+        bids = inner_type._block_ids
+        current_bid = bids[-1]
+        parent_pos = self._sparse_parent_position(inner_type)
+
+        sparse_tt = inner_type._sparse_tensor_type
+        # ptrs/coords are length ``len(shape)`` and aligned to level order.
+        # This level's own slot is at index ``len(bids) - 1``.
+        level_idx = len(bids) - 1
+        ptrs_seq = sparse_tt.element_types["ptrs"]
+        coords_seq = sparse_tt.element_types["coords"]
+        assert isinstance(ptrs_seq, SequenceType)
+        assert isinstance(coords_seq, SequenceType)
+        ptr_t = ptrs_seq.element_types[level_idx]
+        coord_t = coords_seq.element_types[level_idx]
+        assert isinstance(ptr_t, TensorType), (
+            f"hl.sparse_tile: Compressed level {level_idx} requires a ptrs"
+            f" tensor; got {ptr_t!s}"
+        )
+        assert isinstance(coord_t, TensorType), (
+            f"hl.sparse_tile: Compressed level {level_idx} requires a coords"
+            f" tensor; got {coord_t!s}"
+        )
+        ptr_fake = ptr_t.fake_value
+        coord_fake = coord_t.fake_value
+
+        # Compute the per-parent-position segment in the OUTER graph.
+        start = hl.load(ptr_fake, [parent_pos])
+        end_ptr = hl.load(ptr_fake, [parent_pos + 1])
         lengths = end_ptr - start
         end = torch.amax(lengths)
 
-        # Lift inputs: ``lengths`` MUST be ``flat_values[0]`` so the masking
-        # path in indexing_strategy can find it (jagged_tile convention).
+        # Lift inputs: ``lengths`` MUST be flat_values[0] so the jagged
+        # masking path in indexing_strategy can find it.
         rw: ReadWrites = ReadWrites.from_ast(node)
         inputs_dict: dict[str, object] = {"__sparse_lengths": lengths}
         for name in self._rw_names(rw):
@@ -997,38 +1089,46 @@ class WalkDeviceAST(NodeVisitor):
         assert inputs.flat_values[0] is lengths
 
         inner_sym = env.block_sizes[current_bid].var
-        block_ids_key = tuple(inner_type._block_ids)
 
         def build_subgraph(
             subgraph_walker: WalkDeviceAST,
         ) -> tuple[list[object], LiftTensorArgs]:
             start_ph = subgraph_walker.scope["__sparse_start"]
             assert isinstance(start_ph, torch.Tensor)
-            p_k_index = hl.tile_index(inner_sym)
-            # start has shape (P0,...,P_{k-1}); add a trailing 1-dim and rely
-            # on broadcasting to align p_k_index (shape (P_k,)) from the right.
-            off_k = start_ph.unsqueeze(-1) + p_k_index
-            crd_k = hl.load(coord_fake, [off_k])
-            env.sparse_tile_meta[block_ids_key] = SparseTileMeta(
-                off_fake=off_k,
-                coord_fake=crd_k,
-                values_ref_fake=values_fake,
-                parent_block_ids=parent_key if parent_key else None,
-            )
-            subgraph_walker._assign(node.target, crd_k)
+            inner_tile = hl.tile_index(inner_sym)
+            # start_ph has shape (P0, ..., P_{k-1}); broadcast a trailing
+            # axis with inner_tile (shape (P_k,)) to get (..., P_k).
+            self_position = start_ph.unsqueeze(-1) + inner_tile
+            self_coord = hl.load(coord_fake, [self_position])
+            env.sparse_tile_position[current_bid] = self_position
+            subgraph_walker._assign(node.target, self_coord)
             subgraph_walker._body(node.body)
             loop_outputs = self._collect_outputs(
                 subgraph_walker.scope, rw.writes
             )
             return loop_outputs.get_tensor_args(), loop_outputs
 
+        self._finish_sparse_loop(
+            inputs, build_subgraph, current_bid, begin=0, end=end
+        )
+
+    def _finish_sparse_loop(
+        self,
+        inputs: LiftTensorArgs,
+        build_subgraph: "Callable[[WalkDeviceAST], tuple[list[object], LiftTensorArgs]]",
+        current_bid: int,
+        *,
+        begin: object,
+        end: object,
+    ) -> None:
+        """Shared epilogue: trace the subgraph and stitch outputs with phi."""
         graph_idx, outputs = self._trace_graph(
             inputs,
             build_subgraph,
             graph_info_cls=ForLoopGraphInfo,
             block_ids=[current_bid],
         )
-        args = (graph_idx, [0], [end], inputs.get_tensor_args())
+        args = (graph_idx, [begin], [end], inputs.get_tensor_args())
         mode = proxy_tensor.get_proxy_mode()
         assert isinstance(mode, proxy_tensor.ProxyTorchDispatchMode)
         tracer = mode.tracer
@@ -1176,6 +1276,8 @@ class WalkDeviceAST(NodeVisitor):
             raise exc.InvalidDeviceForLoop(iter_type)
         inner_type: TypeInfo = iter_type.inner
         if node._loop_type == LoopType.GRID:
+            if isinstance(inner_type, SparseTileType):
+                self._register_root_sparse_position(inner_type)
             self._assign(node.target, inner_type.proxy())
             self._body(node.body)
         elif node._loop_type == LoopType.DEVICE:
@@ -1786,18 +1888,16 @@ class WalkDeviceAST(NodeVisitor):
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
         # ``tile_k.value`` on a leaf SparseTile expands to a load of the
-        # sparse values tensor at the tile's lifted ``off`` indices.  Type
-        # propagation has already validated that this is a leaf level.
+        # flat ``values`` array at this level's accumulated `position`.
+        # Type propagation has already validated that this is a leaf.
         if node.attr == "value" and isinstance(node.value, ExtendedAST):
             value_type = node.value._type_info
             if isinstance(value_type, SparseTileType):
                 env = CompileEnvironment.current()
-                meta = env.sparse_tile_meta.get(tuple(value_type._block_ids))
-                assert meta is not None, (
-                    "sparse_tile_meta missing for tile.value access; the"
-                    " enclosing hl.sparse_tile loop should have registered it"
-                )
-                return hl.load(meta.values_ref_fake, [meta.off_fake])
+                position = env.sparse_tile_position[value_type._block_ids[-1]]
+                values_t = value_type._sparse_tensor_type.element_types["values"]
+                assert isinstance(values_t, TensorType)
+                return hl.load(values_t.fake_value, [position])
         return getattr(self.visit(node.value), node.attr)
 
     def visit_Expr(self, node: ast.Expr) -> object:
