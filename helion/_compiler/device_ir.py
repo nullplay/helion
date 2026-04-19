@@ -2001,7 +2001,7 @@ class WalkHostAST(NodeVisitor):
                 # pyrefly: ignore [missing-attribute]
                 block_ids = [x.block_id for x in inner.unpack()]
             elif isinstance(inner, SparseTileType):
-                # Outer Dense sparse tile: use the first (outer) block id.
+                # Root sparse tile: the first block id is the grid block.
                 block_ids = inner._block_ids[:1]
             else:
                 # pyrefly: ignore [missing-attribute]

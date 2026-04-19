@@ -1661,26 +1661,6 @@ class SparseTileType(TensorType):
             return TensorType(origin, fake)
         return super().propagate_attribute(attr, origin)
 
-    def proxy(self) -> object:
-        if len(self._block_ids) == 1:
-            # Root tile: act as an iteration handle (like ``hl.tile``) so
-            # ``_tiles_to_sizes([tile_m]) → [P0_sym]`` works for shape args.
-            with proxy_tensor.disable_proxy_modes_tracing():
-                fake_mode = torch._C._unset_dispatch_mode(
-                    torch._C._TorchDispatchModeKey.FAKE
-                )
-                try:
-                    with torch._C._DisableTorchDispatch():
-                        return Tile(self._block_ids[0])
-                finally:
-                    assert fake_mode is not None
-                    torch._C._set_dispatch_mode(fake_mode)
-        # Nested: scope binding is done directly by ``_visit_sparse_tile`` in
-        # device IR using the real traced coord FakeTensor.  This fallback
-        # returns the shape-correct placeholder so anything that inspects it
-        # (shape/dtype) stays sane.
-        return super().proxy()
-
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, SparseTileType) and self._block_ids == other._block_ids:
             return self

@@ -760,9 +760,7 @@ def _(state: CodegenState) -> ast.AST:
     raise exc.NotInsideKernel
 
 
-@_decorators.api(
-    is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
-)
+@_decorators.api(is_device_loop=True, is_device_only=False, cache_type=True)
 def sparse_tile(
     source: object,
     *,
@@ -858,11 +856,11 @@ def _(state: CodegenState) -> ast.AST:
 
     Inner levels are already desugared inside device IR into ``_for_loop``
     subgraphs (see ``_lower_dense_level`` / ``_lower_compressed_level``),
-    so this codegen only runs for the outermost root level — which is
-    required to be ``"Dense"`` (see ``_register_root_sparse_position``).
-    Emits a grid launch over ``[0, shape[dim])`` by rewriting
-    ``state.proxy_args`` into the ``(end, None, None)`` shape that
-    ``codegen_grid`` expects from ``hl.tile(N)``.
+    so this codegen only runs for the outermost root level (Dense or
+    Compressed; see ``_lower_grid_level``).  Emits a grid launch over
+    ``[0, shape[dim])`` (Dense) or ``[0, nnz_rows)`` (Compressed) by
+    rewriting ``state.proxy_args`` into the ``(end, None, None)`` shape
+    that ``codegen_grid`` expects from ``hl.tile(N)``.
     """
     for_loop = ExtendedAST.current()[-2]
     assert isinstance(for_loop, ast.For)
