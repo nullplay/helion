@@ -198,7 +198,7 @@ class TypeInfo:
 
     @classmethod
     def from_example(cls, value: object, origin: Origin) -> TypeInfo:
-        from ..language.sparse_tensor import SparseTensor 
+        from ..language.sparse_tensor import SparseTensor
 
         if isinstance(value, SparseTensor):
             keys = list(value.__dataclass_fields__.keys())
@@ -523,9 +523,7 @@ class TensorType(TypeInfo):
                 # Multi-dim sparse tile index: consumes 1 input dim, contributes
                 # one output dim per level (e.g. [P0, P1] for a 2-level tile).
                 inputs_consumed += 1
-                output_sizes.extend(
-                    [env.block_sizes[bid].var for bid in k._block_ids]
-                )
+                output_sizes.extend([env.block_sizes[bid].var for bid in k._block_ids])
             elif isinstance(k, TensorType) and k.fake_value.dtype == torch.bool:
                 raise exc.DataDependentOutputShapeNotSupported(
                     op_desc="Boolean mask indexing (tensor[boolean_mask])"
@@ -1560,6 +1558,7 @@ class StackTensorType(ClassType):
             .new_empty(self._device_indexing_size(key)),
         )
 
+
 class SparseTensorType(ClassType):
     """Type for ``SparseTensor`` kernel arguments.
 
@@ -1667,7 +1666,6 @@ class SparseTileType(TensorType):
         if isinstance(other, SparseTileType) and self._block_ids == other._block_ids:
             return self
         return TypeInfo.merge(self, other, var_name=var_name)
-
 
 
 class SliceType(CollectionType):

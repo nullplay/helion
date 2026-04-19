@@ -27,7 +27,6 @@ from .loops import jagged_tile as jagged_tile
 from .loops import sparse_tile as sparse_tile
 from .loops import static_range as static_range
 from .loops import tile as tile
-from .sparse_tensor import SparseTensor as SparseTensor
 from .matmul_ops import dot as dot
 from .matmul_ops import dot_scaled as dot_scaled
 from .memory_ops import load as load
@@ -38,6 +37,7 @@ from .reduce_ops import reduce as reduce
 from .scan_ops import associative_scan as associative_scan
 from .scan_ops import cumprod as cumprod
 from .scan_ops import cumsum as cumsum
+from .sparse_tensor import SparseTensor as SparseTensor
 from .stack_tensor import StackTensor as StackTensor
 from .stack_tensor import stacktensor_like as stacktensor_like
 from .tile_ops import tile_begin as tile_begin

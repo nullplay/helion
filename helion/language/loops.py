@@ -29,10 +29,10 @@ from .._compiler.type_propagation import JaggedTileIndexType
 from .._compiler.type_propagation import LiteralType
 from .._compiler.type_propagation import Origin
 from .._compiler.type_propagation import SequenceType
-from .._compiler.type_propagation import TensorType
-from .._compiler.type_propagation import TileIndexType
 from .._compiler.type_propagation import SparseTensorType
 from .._compiler.type_propagation import SparseTileType
+from .._compiler.type_propagation import TensorType
+from .._compiler.type_propagation import TileIndexType
 from .._compiler.type_propagation import TypeInfo
 from .._compiler.variable_origin import GetItemOrigin
 from ..autotuner.config_spec import ConfigSpec
@@ -799,7 +799,7 @@ def _sparse_tile_propagation(
     if lvlfmt in ("Compressed", "Jagged"):
         if parent_block_ids:
             inner = TileIndexType.allocate(None, origin)
-            env.register_jagged_tile(inner.block_id, parent_block_ids[-1])
+            env.register_jagged_tile(inner.block_id, parent_block_ids)
             _add_config_choices(
                 [inner.block_id],
                 is_tile=True,
@@ -825,9 +825,7 @@ def _sparse_tile_propagation(
         )
         shape_for_dim = shape_seq.element_types[dim_val].proxy()
         inner = TileIndexType.allocate(shape_for_dim, origin)
-        _add_config_choices(
-            [inner.block_id], is_tile=True, allow_static_ranges=[False]
-        )
+        _add_config_choices([inner.block_id], is_tile=True, allow_static_ranges=[False])
 
     block_ids = [*parent_block_ids, inner.block_id]
     return IterType(
@@ -885,9 +883,7 @@ def _(state: CodegenState) -> ast.AST:
         ptrs0_t = ptrs_seq.element_types[0]
         assert isinstance(ptrs0_t, TensorType)
         ptrs0_host = ptrs0_t.origin.host_str()
-        size_d = expr_from_string(
-            f"({ptrs0_host}[1] - {ptrs0_host}[0]).item()"
-        )
+        size_d = expr_from_string(f"({ptrs0_host}[1] - {ptrs0_host}[0]).item()")
     else:
         raise AssertionError(
             f"unsupported sparse_tile levelformat at root: {inner._levelformat!r}"

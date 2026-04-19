@@ -930,9 +930,7 @@ class WalkDeviceAST(NodeVisitor):
                 return origin.is_device()
         return True
 
-    def _visit_sparse_tile(
-        self, node: ast.For, inner_type: SparseTileType
-    ) -> None:
+    def _visit_sparse_tile(self, node: ast.For, inner_type: SparseTileType) -> None:
         """Dispatch per-level sparse_tile lowering.
 
         GRID-scope sparse_tile goes through ``_lower_grid_level`` (no
@@ -951,13 +949,9 @@ class WalkDeviceAST(NodeVisitor):
         elif fmt == "Compressed":
             self._lower_compressed_level(node, inner_type)
         else:
-            raise AssertionError(
-                f"hl.sparse_tile: unsupported levelformat {fmt!r}"
-            )
+            raise AssertionError(f"hl.sparse_tile: unsupported levelformat {fmt!r}")
 
-    def _lower_grid_level(
-        self, node: ast.For, inner_type: SparseTileType
-    ) -> None:
+    def _lower_grid_level(self, node: ast.For, inner_type: SparseTileType) -> None:
         """Lower a root-level (GRID) ``hl.sparse_tile`` loop.
 
         No subgraph / no ``_for_loop`` — iteration comes from the kernel
@@ -989,9 +983,7 @@ class WalkDeviceAST(NodeVisitor):
         self._assign(node.target, loop_var)
         self._body(node.body)
 
-    def _sparse_parent_position(
-        self, inner_type: SparseTileType
-    ) -> torch.Tensor | int:
+    def _sparse_parent_position(self, inner_type: SparseTileType) -> torch.Tensor | int:
         """Return the parent level's flat `position` into `values`.
 
         At the root (single block_id) the parent is synthetic and its
@@ -1004,9 +996,7 @@ class WalkDeviceAST(NodeVisitor):
             return 0
         return env.sparse_tile_position[bids[-2]]
 
-    def _lower_dense_level(
-        self, node: ast.For, inner_type: SparseTileType
-    ) -> None:
+    def _lower_dense_level(self, node: ast.For, inner_type: SparseTileType) -> None:
         env = CompileEnvironment.current()
         bids = inner_type._block_ids
         current_bid = bids[-1]
@@ -1052,9 +1042,7 @@ class WalkDeviceAST(NodeVisitor):
             env.sparse_tile_position[current_bid] = self_position
             subgraph_walker._assign(node.target, coord)
             subgraph_walker._body(node.body)
-            loop_outputs = self._collect_outputs(
-                subgraph_walker.scope, rw.writes
-            )
+            loop_outputs = self._collect_outputs(subgraph_walker.scope, rw.writes)
             return loop_outputs.get_tensor_args(), loop_outputs
 
         self._finish_sparse_loop(
@@ -1094,13 +1082,12 @@ class WalkDeviceAST(NodeVisitor):
         start = hl.load(ptr_fake, [parent_pos])
         end_ptr = hl.load(ptr_fake, [parent_pos + 1])
         lengths = end_ptr - start
+        # Inductor only supports one reduction dim per buffer; flatten to
+        # collapse multi-axis parents into a single-axis reduction.
         if isinstance(lengths, torch.Tensor) and lengths.ndim >= 2:
-            raise NotImplementedError(
-                f"hl.sparse_tile: Compressed level {level_idx} nested under"
-                f" {lengths.ndim} parent levels — jagged_tile only supports"
-                " 1-D lengths today."
-            )
-        end = torch.amax(lengths)
+            end = torch.amax(lengths.reshape(-1))
+        else:
+            end = torch.amax(lengths)
 
         # Lift inputs: ``lengths`` MUST be flat_values[0] so the jagged
         # masking path in indexing_strategy can find it.
@@ -1132,19 +1119,15 @@ class WalkDeviceAST(NodeVisitor):
             env.sparse_tile_position[current_bid] = self_position
             subgraph_walker._assign(node.target, self_coord)
             subgraph_walker._body(node.body)
-            loop_outputs = self._collect_outputs(
-                subgraph_walker.scope, rw.writes
-            )
+            loop_outputs = self._collect_outputs(subgraph_walker.scope, rw.writes)
             return loop_outputs.get_tensor_args(), loop_outputs
 
-        self._finish_sparse_loop(
-            inputs, build_subgraph, current_bid, begin=0, end=end
-        )
+        self._finish_sparse_loop(inputs, build_subgraph, current_bid, begin=0, end=end)
 
     def _finish_sparse_loop(
         self,
         inputs: LiftTensorArgs,
-        build_subgraph: "Callable[[WalkDeviceAST], tuple[list[object], LiftTensorArgs]]",
+        build_subgraph: Callable[[WalkDeviceAST], tuple[list[object], LiftTensorArgs]],
         current_bid: int,
         *,
         begin: object,
@@ -1195,7 +1178,13 @@ class WalkDeviceAST(NodeVisitor):
         assert isinstance(func_node, ExtendedAST)
         func_type = func_node._type_info
         assert isinstance(func_type, CallableType)
-        assert func_type.value in (hl.jagged_tile, hl.sparse_tile, hl.tile, hl.grid, builtins.range)
+        assert func_type.value in (
+            hl.jagged_tile,
+            hl.sparse_tile,
+            hl.tile,
+            hl.grid,
+            builtins.range,
+        )
         args = call_node.args
         assert len(args) >= 1
         if len(args) == 1:
