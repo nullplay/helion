@@ -1627,6 +1627,12 @@ class SparseTileType(TensorType):
             fake_value = coord_t.fake_value.new_empty(shape)
         else:
             fake_value = torch.empty(shape, dtype=torch.int64, device=env.device)
+        # A sparse tile is always a device-side coord tensor (created by
+        # hl.tile_index / hl.load(coords, ...)), so its origin must report
+        # is_host()==False — otherwise visit_Subscript routes ``tile[:, None]``
+        # through hl.load and crashes (the tile isn't a registered host arg).
+        if origin.is_host() and isinstance(origin, SourceOrigin):
+            origin = DeviceOrigin(origin.location)
         super().__init__(origin, fake_value)
         self._sparse_tensor_type = sparse_tensor_type
         self._levelformat = levelformat

@@ -796,15 +796,27 @@ def _sparse_tile_propagation(
         parent_block_ids = list(source._block_ids)
 
     if lvlfmt in ("Compressed", "Jagged"):
-        inner = TileIndexType.allocate(None, origin)
         if parent_block_ids:
+            inner = TileIndexType.allocate(None, origin)
             env.register_jagged_tile(inner.block_id, parent_block_ids[-1])
-        _add_config_choices(
-            [inner.block_id],
-            is_tile=True,
-            allow_static_ranges=[False],
-            has_data_dependent_bounds=True,
-        )
+            _add_config_choices(
+                [inner.block_id],
+                is_tile=True,
+                allow_static_ranges=[False],
+                has_data_dependent_bounds=True,
+            )
+        else:
+            coords_seq = sparse_tt.element_types["coords"]
+            assert isinstance(coords_seq, SequenceType)
+            coord_t = coords_seq.element_types[0]
+            assert isinstance(coord_t, TensorType), (
+                "root Compressed sparse_tile requires coords[0] tensor"
+            )
+            nnz_bound = coord_t.fake_value.size(0)
+            inner = TileIndexType.allocate(nnz_bound, origin)
+            _add_config_choices(
+                [inner.block_id], is_tile=True, allow_static_ranges=[False]
+            )
     else:  # Dense — fixed bound from the tensor's shape[dim_val]
         shape_seq = sparse_tt.element_types["shape"]
         assert isinstance(shape_seq, SequenceType), (
@@ -862,13 +874,23 @@ def _(state: CodegenState) -> ast.AST:
     assert loop_type == LoopType.GRID, (
         f"inner sparse_tile loops are desugared in device IR; got {loop_type!r}"
     )
-    assert inner._levelformat == "Dense", (
-        "hl.sparse_tile at the root (GRID) level must be Dense; got"
-        f" levelformat={inner._levelformat!r}"
-    )
-    shape_seq = inner._sparse_tensor_type.element_types["shape"]
-    assert isinstance(shape_seq, SequenceType)
-    size_d = shape_seq.element_types[inner._dim].proxy()
+    if inner._levelformat == "Dense":
+        shape_seq = inner._sparse_tensor_type.element_types["shape"]
+        assert isinstance(shape_seq, SequenceType)
+        size_d = shape_seq.element_types[inner._dim].proxy()
+    elif inner._levelformat == "Compressed":
+        ptrs_seq = inner._sparse_tensor_type.element_types["ptrs"]
+        assert isinstance(ptrs_seq, SequenceType)
+        ptrs0_t = ptrs_seq.element_types[0]
+        assert isinstance(ptrs0_t, TensorType)
+        ptrs0_host = ptrs0_t.origin.host_str()
+        size_d = expr_from_string(
+            f"({ptrs0_host}[1] - {ptrs0_host}[0]).item()"
+        )
+    else:
+        raise AssertionError(
+            f"unsupported sparse_tile levelformat at root: {inner._levelformat!r}"
+        )
     state.proxy_args[:] = [size_d, None, None]
     state.tile_strategy.codegen_grid(state, inner._block_ids)
     return expr_from_string("None")

@@ -934,11 +934,16 @@ class WalkDeviceAST(NodeVisitor):
     ) -> None:
         """Dispatch per-level sparse_tile lowering.
 
-        Every level is lowered independently by format. A level only
+        GRID-scope sparse_tile goes through ``_lower_grid_level`` (no
+        subgraph, kernel-launch drives iteration). DEVICE-scope
+        sparse_tile is lowered independently per format — each helper
         consumes its parent's ``position`` tensor (flat index into
         ``values``) and publishes its own ``position``; root-ness is a
         1-line ternary inside each helper.
         """
+        if node._loop_type == LoopType.GRID:
+            self._lower_grid_level(node, inner_type)
+            return
         fmt = inner_type._levelformat
         if fmt == "Dense":
             self._lower_dense_level(node, inner_type)
@@ -949,26 +954,39 @@ class WalkDeviceAST(NodeVisitor):
                 f"hl.sparse_tile: unsupported levelformat {fmt!r}"
             )
 
-    def _register_root_sparse_position(
-        self, inner_type: SparseTileType
+    def _lower_grid_level(
+        self, node: ast.For, inner_type: SparseTileType
     ) -> None:
-        """Publish the root sparse level's flat ``position`` so inner levels
-        can find it in ``env.sparse_tile_position``.
+        """Lower a root-level (GRID) ``hl.sparse_tile`` loop.
 
-        The root loop runs at GRID scope (no ``_for_loop`` subgraph), so
-        we register its position inline. Only Dense root is supported for
-        now: ``position = hl.tile_index(outer_sym)``.
+        No subgraph / no ``_for_loop`` — iteration comes from the kernel
+        launch grid. Emits ``position = hl.tile_index(block_size)``,
+        publishes it for inner levels, binds the loop target (``position``
+        itself for Dense, ``coords[0][position]`` for Compressed), and
+        visits the body in the outer walker.
         """
-        assert inner_type._levelformat == "Dense", (
-            "hl.sparse_tile at the root (GRID) level must be Dense; "
-            f"got levelformat={inner_type._levelformat!r}"
-        )
         env = CompileEnvironment.current()
         bids = inner_type._block_ids
         assert len(bids) == 1
         current_bid = bids[-1]
         inner_sym = env.block_sizes[current_bid].var
-        env.sparse_tile_position[current_bid] = hl.tile_index(inner_sym)
+        position = hl.tile_index(inner_sym)
+        env.sparse_tile_position[current_bid] = position
+        fmt = inner_type._levelformat
+        if fmt == "Dense":
+            loop_var: object = position
+        elif fmt == "Compressed":
+            coords_seq = inner_type._sparse_tensor_type.element_types["coords"]
+            assert isinstance(coords_seq, SequenceType)
+            coord_t = coords_seq.element_types[0]
+            assert isinstance(coord_t, TensorType)
+            loop_var = hl.load(coord_t.fake_value, [position])
+        else:
+            raise AssertionError(
+                f"unsupported sparse_tile levelformat at root: {fmt!r}"
+            )
+        self._assign(node.target, loop_var)
+        self._body(node.body)
 
     def _sparse_parent_position(
         self, inner_type: SparseTileType
@@ -1023,11 +1041,15 @@ class WalkDeviceAST(NodeVisitor):
                 # parent_ph has shape (P0, ..., P_{k-1}); broadcast a trailing
                 # axis with inner_tile (shape (P_k,)) to get (..., P_k).
                 self_position = parent_ph.unsqueeze(-1) * size_d + inner_tile
+                # Tree-inheritance: bind target to the parent-shaped coord so
+                # `.size(k)` and ancestor-indexed ops see the full shape.
+                coord = parent_ph.unsqueeze(-1) * 0 + inner_tile
             else:
                 # root: parent_pos is scalar 0 -> self_position == inner_tile
                 self_position = inner_tile
+                coord = inner_tile
             env.sparse_tile_position[current_bid] = self_position
-            subgraph_walker._assign(node.target, inner_tile)
+            subgraph_walker._assign(node.target, coord)
             subgraph_walker._body(node.body)
             loop_outputs = self._collect_outputs(
                 subgraph_walker.scope, rw.writes
@@ -1071,6 +1093,12 @@ class WalkDeviceAST(NodeVisitor):
         start = hl.load(ptr_fake, [parent_pos])
         end_ptr = hl.load(ptr_fake, [parent_pos + 1])
         lengths = end_ptr - start
+        if isinstance(lengths, torch.Tensor) and lengths.ndim >= 2:
+            raise NotImplementedError(
+                f"hl.sparse_tile: Compressed level {level_idx} nested under"
+                f" {lengths.ndim} parent levels — jagged_tile only supports"
+                " 1-D lengths today."
+            )
         end = torch.amax(lengths)
 
         # Lift inputs: ``lengths`` MUST be flat_values[0] so the jagged
@@ -1277,8 +1305,10 @@ class WalkDeviceAST(NodeVisitor):
         inner_type: TypeInfo = iter_type.inner
         if node._loop_type == LoopType.GRID:
             if isinstance(inner_type, SparseTileType):
-                self._register_root_sparse_position(inner_type)
-            self._assign(node.target, inner_type.proxy())
+                self._visit_sparse_tile(node, inner_type)
+                return
+            loop_var = inner_type.proxy()
+            self._assign(node.target, loop_var)
             self._body(node.body)
         elif node._loop_type == LoopType.DEVICE:
             if isinstance(inner_type, SparseTileType):
