@@ -120,11 +120,56 @@ def pallas_sum_reduction(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_sum_reduce_dim0(x: torch.Tensor) -> torch.Tensor:
+    _n, m = x.size()
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = x[:, tile_m].sum(0)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_sum_reduce_middle(x: torch.Tensor) -> torch.Tensor:
+    b, _n, m = x.size()
+    out = torch.empty([b, m], dtype=x.dtype, device=x.device)
+    for tile_b, tile_m in hl.tile([b, m]):
+        out[tile_b, tile_m] = x[tile_b, :, tile_m].sum(1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_sum_reduce_multiple(x: torch.Tensor) -> torch.Tensor:
+    b, _n, _m = x.size()
+    out = torch.empty([b], dtype=x.dtype, device=x.device)
+    for tile_b in hl.tile(b):
+        out[tile_b] = x[tile_b, :, :].sum([0, 1])
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_max_reduction(x: torch.Tensor) -> torch.Tensor:
     n, _m = x.size()
     out = torch.empty([n], dtype=x.dtype, device=x.device)
     for tile_n in hl.tile(n):
         out[tile_n] = torch.amax(x[tile_n, :], dim=-1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_min_reduction(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    for tile_n in hl.tile(n):
+        out[tile_n] = torch.amin(x[tile_n, :], dim=-1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_argmin_reduction(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty([n], dtype=torch.int32, device=x.device)
+    for tile_n in hl.tile(n):
+        out[tile_n] = torch.argmin(x[tile_n, :], dim=-1).to(torch.int32)
     return out
 
 
@@ -244,6 +289,49 @@ def pallas_reduce_non_pow2(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_estimate_pallas_vmem_bytes(self) -> None:
+        """VMEM OOM: Tests that block sizes and dtypes (fp32, bf16) are correctly estimated."""
+
+        # Test 1: float32 (4 bytes per element)
+        # 3 tensors * 2048 * 4096 * 4 bytes * 2 (multiplier) = ~201.3MB (OOM)
+        args_f32 = (
+            torch.randn(2048, 4096, device=DEVICE, dtype=torch.float32),
+            torch.randn(2048, 4096, device=DEVICE, dtype=torch.float32),
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"Ran out of memory in memory space vmem.*Estimated [0-9.]+MB exceeds",
+        ):
+            code_and_output(pallas_add_2d, args_f32, block_sizes=[2048, 4096])
+
+        # Test 2: bfloat16 (2 bytes per element)
+        # 3 tensors * 1024 * 4096 * 2 bytes * 2 (multiplier) = ~50.3MB (Passes safely under 64MB)
+        args_bf16 = (
+            torch.randn(1024, 4096, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(1024, 4096, device=DEVICE, dtype=torch.bfloat16),
+        )
+        try:
+            code_and_output(pallas_add_2d, args_bf16, block_sizes=[1024, 4096])
+        except Exception as e:
+            if "Ran out of memory in memory space vmem" in str(e):
+                self.fail(f"bfloat16 incorrectly threw VMEM OOM: {e}")
+
+        # Test 3: float8_e4m3fn (1 byte per element)
+        # 3 tensors * 4096 * 8192 * 1 byte * 2 (multiplier) = ~201.3MB (OOM)
+        args_fp8 = (
+            torch.randn(4096, 8192, device=DEVICE, dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            ),
+            torch.randn(4096, 8192, device=DEVICE, dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            ),
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"Ran out of memory in memory space vmem.*Estimated [0-9.]+MB exceeds",
+        ):
+            code_and_output(pallas_add_2d, args_fp8, block_sizes=[4096, 8192])
+
     def test_add_1d(self) -> None:
         args = (torch.randn(1024, device=DEVICE), torch.randn(1024, device=DEVICE))
         code, result = code_and_output(add_kernel, args, block_size=256)
@@ -355,11 +443,48 @@ class TestPallas(TestCase):
         self.assertIn("jnp.sum", code)
         torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
 
+    def test_sum_reduction_large(self) -> None:
+        x = torch.randn(8, 16384, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_sum_reduction, (x,), block_size=1)
+        self.assertIn("jnp.sum", code)
+        torch.testing.assert_close(result, x.sum(-1), rtol=1e-3, atol=1e-3)
+
+    def test_sum_reduce_dim0(self) -> None:
+        x = torch.randn(64, 32, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_sum_reduce_dim0, (x,), block_size=16)
+        self.assertIn("jnp.sum", code)
+        torch.testing.assert_close(result, x.sum(0), rtol=1e-4, atol=1e-4)
+
+    def test_sum_reduce_middle(self) -> None:
+        x = torch.randn(4, 64, 32, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_sum_reduce_middle, (x,), block_sizes=[2, 16]
+        )
+        self.assertIn("jnp.sum", code)
+        torch.testing.assert_close(result, x.sum(1), rtol=1e-4, atol=1e-4)
+
+    def test_sum_reduce_multiple(self) -> None:
+        x = torch.randn(4, 32, 64, device=DEVICE, dtype=torch.float32)
+        with self.assertRaises(NotImplementedError):
+            code_and_output(pallas_sum_reduce_multiple, (x,), block_size=2)
+
     def test_max_reduction(self) -> None:
         x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(pallas_max_reduction, (x,), block_size=16)
         self.assertIn("jnp.max", code)
         torch.testing.assert_close(result, torch.amax(x, dim=-1), rtol=1e-4, atol=1e-4)
+
+    def test_min_reduction(self) -> None:
+        x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_min_reduction, (x,), block_size=16)
+        self.assertIn("jnp.min", code)
+        torch.testing.assert_close(result, torch.amin(x, dim=-1), rtol=1e-4, atol=1e-4)
+
+    def test_argmin_reduction(self) -> None:
+        x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_argmin_reduction, (x,), block_size=16)
+        self.assertIn("jnp.argmin", code)
+        torch.testing.assert_close(result, torch.argmin(x, dim=-1).to(torch.int32))
 
     def test_tile_begin_end(self) -> None:
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
@@ -840,6 +965,72 @@ class TestPallas(TestCase):
         )
         self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_fori_loop_no_dma_unaligned_inner_block(self) -> None:
+        """fori_loop with inner block violating DMA alignment (last dim % 128 != 0).
+
+        Exercises the non-DMA fallback: instead of pltpu.make_async_copy,
+        codegen should emit pl.ds() slicing into the outer BlockSpec refs.
+        """
+        args = (
+            torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[8, 64],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertNotIn("pltpu.make_async_copy", code)
+        self.assertIn("pl.ds(", code)
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_fori_loop_no_dma_multidim_unaligned(self) -> None:
+        """Nested fori_loop with a DMA-unaligned inner block.
+
+        2D inner loop where both inner dims are too small for DMA
+        (last dim = 64 < 128).  Validates that the non-DMA pl.ds()
+        path works with nested fori_loops, one per inner dim.
+        """
+        args = (
+            torch.randn(4, 32, 64, device=DEVICE, dtype=torch.float32),
+            torch.randn(4, 32, 64, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_add_3d,
+            args,
+            block_sizes=[1, 8, 64],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
+        self.assertNotIn("pltpu.make_async_copy", code)
+        self.assertIn("pl.ds(", code)
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    @xfailIfPallas(
+        "No config values to tune because all block sizes are fixed and Pallas no longer tunes reduction loops"
+    )
+    def test_squeeze_slice_access(self) -> None:
+        """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            (N,) = x.shape
+            (M,) = y.shape
+            out = torch.empty((N, M), dtype=x.dtype)
+            for tile in hl.tile([N], block_size=[M]):
+                out[tile, :] = (x[tile][:, None] < y[None, :]).to(torch.float32)
+            return out
+
+        N = 1024
+        M = 128
+        x = torch.randn(N, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(M, device=DEVICE, dtype=torch.float32)
+        result = fn(x, y)
+        expected = (x[:, None] < y[None, :]).to(torch.float32)
+        torch.testing.assert_close(result, expected)
 
 
 if __name__ == "__main__":
