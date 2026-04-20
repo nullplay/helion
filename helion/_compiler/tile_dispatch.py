@@ -414,6 +414,8 @@ class TileStrategyDispatch:
         Examples:
             (u0, u2) -> (u0, u2, u1) => "[:, :, None]"
             (u2, u0) -> (u0, u2, u1) => ".permute(1, 0)[:, :, None]"
+            (u0, u2) -> (1, u2)      => ""   (u0 absorbed by dst size-1 via
+                                              broadcast; no transform needed)
         """
         if not self.supports_index_rank_expansion():
             return ""
@@ -423,7 +425,10 @@ class TileStrategyDispatch:
 
         env = CompileEnvironment.current()
 
-        # Map each source dim to a unique destination dim with equal symbolic size.
+        # Map each source dim to a unique destination dim. Prefer exact
+        # symbolic-size matches; fall back to size-1 dst dims (broadcast-
+        # compatible) so that broadcast-advertised coords with singleton
+        # parent axes can still be paired with the full-size jagged mask.
         src_to_dst: list[int] = []
         used_dst: set[int] = set()
         for src_dim in src_shape:
@@ -434,6 +439,13 @@ class TileStrategyDispatch:
                 if env.known_equal(src_dim, dst_dim):
                     match = dst_i
                     break
+            if match is None:
+                for dst_i, dst_dim in enumerate(dst_shape):
+                    if dst_i in used_dst:
+                        continue
+                    if env.known_equal(dst_dim, 1):
+                        match = dst_i
+                        break
             assert match is not None, (
                 f"Cannot map src dim {src_dim} into dst shape {dst_shape} "
                 f"from src shape {src_shape}"

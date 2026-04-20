@@ -1045,9 +1045,14 @@ class WalkDeviceAST(NodeVisitor):
                 # parent_ph has shape (P0, ..., P_{k-1}); broadcast a trailing
                 # axis with inner_tile (shape (P_k,)) to get (..., P_k).
                 self_position = parent_ph.unsqueeze(-1) * size_d + inner_tile
-                # Tree-inheritance: bind target to the parent-shaped coord so
-                # `.size(k)` and ancestor-indexed ops see the full shape.
-                coord = parent_ph.unsqueeze(-1) * 0 + inner_tile
+                # Singleton-broadcast coord: advertise parent rank via size-1
+                # dims so NumPy broadcasting recovers the parent-shaped result
+                # at consumer sites, while the coord itself never materializes
+                # the parent axes. Use the parent tile (not the coord) as the
+                # authoritative source for ancestor-dim sizes.
+                coord = inner_tile.broadcast_to(
+                    (*((1,) * parent_ph.ndim), inner_tile.shape[-1])
+                )
             else:
                 # root: parent_pos is scalar 0 -> self_position == inner_tile
                 self_position = inner_tile
@@ -1144,8 +1149,8 @@ class WalkDeviceAST(NodeVisitor):
         variable-length segments, same ``__sparse_lengths`` lift for the
         jagged masking path), but there is no coord tensor: the coord
         exposed to the loop body is the local tile index itself, broadcast
-        across the parent shape — ``parent.unsqueeze(-1) * 0 + inner_tile``,
-        matching the Dense lowering's coord pattern. ``self_position``
+        across the parent shape — ``inner_tile.broadcast_to((*parent.shape,
+        P_k))``, matching the Dense lowering's coord pattern. ``self_position``
         (still ``start + inner_tile``) continues to flow to child levels as
         the flat index into ``values``.
         """
@@ -1204,11 +1209,13 @@ class WalkDeviceAST(NodeVisitor):
             inner_tile = hl.tile_index(inner_sym)
             # self_position: flat index into values, same as Compressed.
             self_position = start_ph.unsqueeze(-1) + inner_tile
-            # Dense-like coord: tile index broadcast across parent shape.
-            # Using start_ph (already in scope) rather than re-lifting
-            # parent_pos; the ``* 0`` wipes the start offset while
-            # preserving shape/broadcast.
-            coord = start_ph.unsqueeze(-1) * 0 + inner_tile
+            # Dense-like coord with singleton parent dims. Uses
+            # ``start_ph.ndim`` (already in scope) for the parent rank; the
+            # coord never materializes the parent axes, and NumPy broadcast
+            # rules recover the parent-shaped result at consumer sites.
+            coord = inner_tile.broadcast_to(
+                (*((1,) * start_ph.ndim), inner_tile.shape[-1])
+            )
             env.sparse_tile_position[current_bid] = self_position
             subgraph_walker._assign(node.target, coord)
             subgraph_walker._body(node.body)
