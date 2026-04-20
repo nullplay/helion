@@ -63,6 +63,37 @@ def _build_cc() -> hl.SparseTensor:
     )
 
 
+def _build_dp() -> hl.SparseTensor:
+    # DP (Dense-Padded, ELL-style): pad_size = max row-nnz = 2.
+    # Padding convention: coord = 0, value = 0 → multiplied slot contributes 0.
+    # row 0: non-zeros at cols 0, 2 → coord [0, 2], value [1, 2]
+    # row 1: non-zero at col 1  → coord [1, 0 (pad)], value [3, 0 (pad)]
+    coords1 = torch.tensor([[0, 2], [1, 0]], dtype=torch.int64, device=DEVICE)
+    values = torch.tensor([1.0, 2.0, 3.0, 0.0], device=DEVICE)
+    return hl.SparseTensor(
+        values=values,
+        shape=_SHAPE,
+        ptrs=(None, None),
+        coords=(None, coords1),
+    )
+
+
+def _build_cp() -> hl.SparseTensor:
+    # CP (Compressed-Padded): outer Compressed picks the non-empty rows, inner
+    # Padded stores pad_size=2 (coord, value) pairs per stored row.  Both rows
+    # are non-empty here, so coords1 shape is (nnz_rows=2, pad_size=2).
+    ptrs0 = torch.tensor([0, 2], dtype=torch.int64, device=DEVICE)
+    coords0 = torch.tensor([0, 1], dtype=torch.int64, device=DEVICE)
+    coords1 = torch.tensor([[0, 2], [1, 0]], dtype=torch.int64, device=DEVICE)
+    values = torch.tensor([1.0, 2.0, 3.0, 0.0], device=DEVICE)
+    return hl.SparseTensor(
+        values=values,
+        shape=_SHAPE,
+        ptrs=(ptrs0, None),
+        coords=(coords0, coords1),
+    )
+
+
 @helion.kernel(config=helion.Config(block_sizes=[2, 32]))
 def spmv(
     A: hl.SparseTensor,
@@ -86,6 +117,8 @@ _SPMV_LAYOUTS = {
     ("Dense", "Compressed"): _build_dc,
     ("Compressed", "Dense"): _build_cd,
     ("Compressed", "Compressed"): _build_cc,
+    ("Dense", "Padded"): _build_dp,
+    ("Compressed", "Padded"): _build_cp,
 }
 
 
@@ -235,11 +268,54 @@ def sdot(
     return C.view(I, J)
 
 
+def _build_dpd() -> hl.SparseTensor:
+    # DPD layout: Dense-Padded-Dense. Every (i, j) is non-empty in the 3D
+    # fixture (J=2, pad_size=2), so coords1 just enumerates [0, 1] per i.
+    # Values are flat row-major of A[i, padded[i, :], k].
+    coords1 = torch.tensor([[0, 1], [0, 1]], dtype=torch.int64, device=DEVICE)
+    values = torch.tensor(
+        [1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 0.0, 0.0, 5.0, 4.0, 6.0, 0.0],
+        device=DEVICE,
+    )
+    return hl.SparseTensor(
+        values=values,
+        shape=_SHAPE_3D,
+        ptrs=(None, None, None),
+        coords=(None, coords1, None),
+    )
+
+
+def _build_ddp() -> hl.SparseTensor:
+    # DDP layout: Dense-Dense-Padded.  pad_size = max over-(i,j) of non-zeros
+    # per fixture row = 2.  coord is the natural 3-D shape ``(I, J, pad_size)
+    # == (2, 2, 2)``; the lowering flattens it internally via FlattenOrigin
+    # so a single flat ``self_position`` can load it.  Pad slots use coord=0,
+    # value=0 so masked multiplications contribute zero.
+    #   (i=0,j=0) nz at k=0,2 → [0, 2], vals [1, 2]
+    #   (i=0,j=1) nz at k=1   → [1, 0 (pad)], vals [3, 0]
+    #   (i=1,j=0) nz at k=2   → [2, 0 (pad)], vals [5, 0]
+    #   (i=1,j=1) nz at k=0,1 → [0, 1], vals [4, 6]
+    coords2 = torch.tensor(
+        [[[0, 2], [1, 0]], [[2, 0], [0, 1]]], dtype=torch.int64, device=DEVICE
+    )
+    values = torch.tensor(
+        [1.0, 2.0, 3.0, 0.0, 5.0, 0.0, 4.0, 6.0], device=DEVICE
+    )
+    return hl.SparseTensor(
+        values=values,
+        shape=_SHAPE_3D,
+        ptrs=(None, None, None),
+        coords=(None, None, coords2),
+    )
+
+
 _SDOT_LAYOUTS = {
     ("Dense", "Compressed", "Dense"): _build_dcd,
     ("Dense", "Dense", "Compressed"): _build_ddc,
     ("Dense", "Compressed", "Compressed"): _build_dcc,
     ("Compressed", "Compressed", "Dense"): _build_ccd,
+    ("Dense", "Padded", "Dense"): _build_dpd,
+    ("Dense", "Dense", "Padded"): _build_ddp,
 }
 
 

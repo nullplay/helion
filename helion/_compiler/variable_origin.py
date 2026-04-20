@@ -220,6 +220,24 @@ class TensorSizeOrigin(WrappedOrigin):
 
 
 @dataclasses.dataclass
+class FlattenOrigin(WrappedOrigin):
+    """A flat 1-D view of the wrapped tensor, i.e. ``tensor.reshape(-1)``.
+
+    Used by Padded sparse_tile lowering so an N-D coord tensor can be loaded
+    with a single flat index regardless of the parent-position rank.
+    """
+
+    def host_str(self) -> str:
+        return f"{self.value.host_str()}.reshape(-1)"
+
+    def suggest_var_name(self) -> str:
+        return f"{self.value.suggest_var_name()}_flat"
+
+    def to_source(self) -> Source:
+        raise NotImplementedError
+
+
+@dataclasses.dataclass
 class ClosureOrigin(WrappedOrigin):
     key: int
 

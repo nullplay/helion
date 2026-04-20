@@ -69,6 +69,7 @@ from .type_propagation import StackTensorType
 from .type_propagation import TensorType
 from .type_propagation import TileIndexType
 from .type_propagation import TypeInfo
+from .variable_origin import FlattenOrigin
 from .type_propagation import _eval_binary
 from .type_propagation import _eval_compare
 from .type_propagation import _eval_unary
@@ -948,6 +949,8 @@ class WalkDeviceAST(NodeVisitor):
             self._lower_dense_level(node, inner_type)
         elif fmt == "Compressed":
             self._lower_compressed_level(node, inner_type)
+        elif fmt == "Padded":
+            self._lower_padded_level(node, inner_type)
         else:
             raise AssertionError(f"hl.sparse_tile: unsupported levelformat {fmt!r}")
 
@@ -971,6 +974,14 @@ class WalkDeviceAST(NodeVisitor):
         if fmt == "Dense":
             loop_var: object = position
         elif fmt == "Compressed":
+            coords_seq = inner_type._sparse_tensor_type.element_types["coords"]
+            assert isinstance(coords_seq, SequenceType)
+            coord_t = coords_seq.element_types[0]
+            assert isinstance(coord_t, TensorType)
+            loop_var = hl.load(coord_t.fake_value, [position])
+        elif fmt == "Padded":
+            # At the root the pad coord is shape (pad_size,) so a direct
+            # load by ``position`` works (no flatten needed).
             coords_seq = inner_type._sparse_tensor_type.element_types["coords"]
             assert isinstance(coords_seq, SequenceType)
             coord_t = coords_seq.element_types[0]
@@ -1123,6 +1134,88 @@ class WalkDeviceAST(NodeVisitor):
             return loop_outputs.get_tensor_args(), loop_outputs
 
         self._finish_sparse_loop(inputs, build_subgraph, current_bid, begin=0, end=end)
+
+    def _lower_padded_level(self, node: ast.For, inner_type: SparseTileType) -> None:
+        """Lower a ``Padded`` sparse_tile level.
+
+        Padded mirrors Compressed but with a static pad width
+        (``pad_size = coords[level].size(-1)``) instead of a data-dependent
+        ``start/end`` pair. No ``ptrs`` lookup, no ``__sparse_lengths`` lift,
+        no jagged masking: every parent row has exactly ``pad_size`` entries.
+        Coord is 2-D ``(flat_parent_count, pad_size)`` and loaded via
+        multi-index ``hl.load(coord, [parent_pos, inner_tile])`` — no flatten,
+        no reshape. ``self_position = parent_pos * pad_size + inner_tile`` is
+        the flat index into ``values`` and is published for child levels.
+        """
+        env = CompileEnvironment.current()
+        bids = inner_type._block_ids
+        current_bid = bids[-1]
+        parent_pos = self._sparse_parent_position(inner_type)
+
+        sparse_tt = inner_type._sparse_tensor_type
+        level_idx = len(bids) - 1
+        coords_seq = sparse_tt.element_types["coords"]
+        assert isinstance(coords_seq, SequenceType)
+        coord_t = coords_seq.element_types[level_idx]
+        assert isinstance(coord_t, TensorType), (
+            f"hl.sparse_tile: Padded level {level_idx} requires a coords"
+            f" tensor; got {coord_t!s}"
+        )
+        coord_fake = coord_t.fake_value
+        pad_size = coord_fake.size(-1)
+        # Flatten the coord so a single N-D ``self_position`` can load it
+        # regardless of parent rank.  The reshape must NOT enter the fx
+        # trace (view on a host tensor is disallowed inside hl.tile); we
+        # register the flat view as its own host tensor with FlattenOrigin
+        # so tensor_arg emits ``<coord>.reshape(-1)`` at the kernel boundary.
+        if coord_fake.ndim > 1:
+            host_fn = HostFunction.current()
+            with self.disable_tracing():
+                coord_flat = coord_fake.reshape(-1)
+            coord_origin = host_fn.tensor_to_origin[coord_fake]
+            host_fn.tensor_to_origin[coord_flat] = FlattenOrigin(coord_origin)
+        else:
+            coord_flat = coord_fake
+
+        rw: ReadWrites = ReadWrites.from_ast(node)
+        inputs_dict: dict[str, object] = {}
+        if isinstance(parent_pos, torch.Tensor):
+            inputs_dict["__sparse_parent_position"] = parent_pos
+        for name in self._rw_names(rw):
+            if (
+                name in self.scope
+                and self.should_become_arg(self.scope[name])
+                and name not in inputs_dict
+            ):
+                inputs_dict[name] = self.scope[name]
+        inputs = LiftTensorArgs(inputs_dict)
+
+        inner_sym = env.block_sizes[current_bid].var
+
+        def build_subgraph(
+            subgraph_walker: WalkDeviceAST,
+        ) -> tuple[list[object], LiftTensorArgs]:
+            inner_tile = hl.tile_index(inner_sym)
+            if isinstance(parent_pos, torch.Tensor):
+                parent_ph = subgraph_walker.scope["__sparse_parent_position"]
+                assert isinstance(parent_ph, torch.Tensor)
+                self_position = parent_ph.unsqueeze(-1) * pad_size + inner_tile
+            else:
+                # root: parent_pos is scalar 0 → self_position is inner_tile
+                self_position = inner_tile
+            # coord_flat is a pre-registered host tensor (FlattenOrigin); it
+            # is not lifted into inputs_dict but used directly, same pattern
+            # as coord_fake in _lower_compressed_level.
+            self_coord = hl.load(coord_flat, [self_position])
+            env.sparse_tile_position[current_bid] = self_position
+            subgraph_walker._assign(node.target, self_coord)
+            subgraph_walker._body(node.body)
+            loop_outputs = self._collect_outputs(subgraph_walker.scope, rw.writes)
+            return loop_outputs.get_tensor_args(), loop_outputs
+
+        self._finish_sparse_loop(
+            inputs, build_subgraph, current_bid, begin=0, end=pad_size
+        )
 
     def _finish_sparse_loop(
         self,

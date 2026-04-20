@@ -818,6 +818,20 @@ def _sparse_tile_propagation(
             _add_config_choices(
                 [inner.block_id], is_tile=True, allow_static_ranges=[False]
             )
+    elif lvlfmt == "Padded":
+        # Fixed pad width: bound is coords[level].size(-1). Static across
+        # parents → no jagged_tile / data-dependent bound machinery.
+        level_idx = len(parent_block_ids)
+        coords_seq = sparse_tt.element_types["coords"]
+        assert isinstance(coords_seq, SequenceType)
+        coord_t = coords_seq.element_types[level_idx]
+        assert isinstance(coord_t, TensorType), (
+            f"hl.sparse_tile: Padded level {level_idx} requires an N-D coords"
+            f" tensor; got {coord_t!s}"
+        )
+        pad_size = coord_t.fake_value.size(-1)
+        inner = TileIndexType.allocate(pad_size, origin)
+        _add_config_choices([inner.block_id], is_tile=True, allow_static_ranges=[False])
     else:  # Dense — fixed bound from the tensor's shape[dim_val]
         shape_seq = sparse_tt.element_types["shape"]
         assert isinstance(shape_seq, SequenceType), (
@@ -884,6 +898,15 @@ def _(state: CodegenState) -> ast.AST:
         assert isinstance(ptrs0_t, TensorType)
         ptrs0_host = ptrs0_t.origin.host_str()
         size_d = expr_from_string(f"({ptrs0_host}[1] - {ptrs0_host}[0]).item()")
+    elif inner._levelformat == "Padded":
+        # Pad width is the trailing dim of coords[0]; at the root the coord
+        # is simply shape (pad_size,), so ``size(-1)`` returns that directly.
+        coords_seq = inner._sparse_tensor_type.element_types["coords"]
+        assert isinstance(coords_seq, SequenceType)
+        coord0_t = coords_seq.element_types[0]
+        assert isinstance(coord0_t, TensorType)
+        coord0_host = coord0_t.origin.host_str()
+        size_d = expr_from_string(f"{coord0_host}.size(-1)")
     else:
         raise AssertionError(
             f"unsupported sparse_tile levelformat at root: {inner._levelformat!r}"
