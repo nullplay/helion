@@ -94,6 +94,37 @@ def _build_cp() -> hl.SparseTensor:
     )
 
 
+def _build_dj() -> hl.SparseTensor:
+    # DJ (Dense-Jagged): outer Dense enumerates every row; inner Jagged uses
+    # ptrs1 for variable prefix length per row.  No coord tensor — coord ==
+    # tile index within the row's prefix, so stored values include explicit
+    # zeros wherever the matrix has a zero before its last non-zero in that
+    # row.  Row 0 stores cols [0,1,2] = [1,0,2]; row 1 stores cols [0,1] = [0,3].
+    ptrs1 = torch.tensor([0, 3, 5], dtype=torch.int64, device=DEVICE)
+    values = torch.tensor([1.0, 0.0, 2.0, 0.0, 3.0], device=DEVICE)
+    return hl.SparseTensor(
+        values=values,
+        shape=_SHAPE,
+        ptrs=(None, ptrs1),
+        coords=(None, None),
+    )
+
+
+def _build_cj() -> hl.SparseTensor:
+    # CJ (Compressed-Jagged): outer Compressed picks non-empty rows; inner
+    # Jagged uses ptrs1 on the compressed-row ordering.
+    ptrs0 = torch.tensor([0, 2], dtype=torch.int64, device=DEVICE)
+    coords0 = torch.tensor([0, 1], dtype=torch.int64, device=DEVICE)
+    ptrs1 = torch.tensor([0, 3, 5], dtype=torch.int64, device=DEVICE)
+    values = torch.tensor([1.0, 0.0, 2.0, 0.0, 3.0], device=DEVICE)
+    return hl.SparseTensor(
+        values=values,
+        shape=_SHAPE,
+        ptrs=(ptrs0, ptrs1),
+        coords=(coords0, None),
+    )
+
+
 @helion.kernel(config=helion.Config(block_sizes=[2, 32]))
 def spmv(
     A: hl.SparseTensor,
@@ -119,6 +150,8 @@ _SPMV_LAYOUTS = {
     ("Compressed", "Compressed"): _build_cc,
     ("Dense", "Padded"): _build_dp,
     ("Compressed", "Padded"): _build_cp,
+    ("Dense", "Jagged"): _build_dj,
+    ("Compressed", "Jagged"): _build_cj,
 }
 
 
@@ -298,14 +331,52 @@ def _build_ddp() -> hl.SparseTensor:
     coords2 = torch.tensor(
         [[[0, 2], [1, 0]], [[2, 0], [0, 1]]], dtype=torch.int64, device=DEVICE
     )
-    values = torch.tensor(
-        [1.0, 2.0, 3.0, 0.0, 5.0, 0.0, 4.0, 6.0], device=DEVICE
-    )
+    values = torch.tensor([1.0, 2.0, 3.0, 0.0, 5.0, 0.0, 4.0, 6.0], device=DEVICE)
     return hl.SparseTensor(
         values=values,
         shape=_SHAPE_3D,
         ptrs=(None, None, None),
         coords=(None, None, coords2),
+    )
+
+
+def _build_djj() -> hl.SparseTensor:
+    # DJJ layout: Dense-Jagged-Jagged.  Every i has J=2 j-entries
+    # (ptrs1 = [0, 2, 4]); each (i, j) stores a k-prefix up to its last
+    # non-zero with explicit zeros for gaps.
+    #   (i=0,j=0) last nz at k=2 → prefix len 3, vals [1, 0, 2]
+    #   (i=0,j=1) last nz at k=1 → prefix len 2, vals [0, 3]
+    #   (i=1,j=0) last nz at k=2 → prefix len 3, vals [0, 0, 5]
+    #   (i=1,j=1) last nz at k=1 → prefix len 2, vals [4, 6]
+    ptrs1 = torch.tensor([0, 2, 4], dtype=torch.int64, device=DEVICE)
+    ptrs2 = torch.tensor([0, 3, 5, 8, 10], dtype=torch.int64, device=DEVICE)
+    values = torch.tensor(
+        [1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 0.0, 5.0, 4.0, 6.0], device=DEVICE
+    )
+    return hl.SparseTensor(
+        values=values,
+        shape=_SHAPE_3D,
+        ptrs=(None, ptrs1, ptrs2),
+        coords=(None, None, None),
+    )
+
+
+def _build_dpj() -> hl.SparseTensor:
+    # DPJ layout: Dense-Padded-Jagged.  Outer Dense over i, middle Padded
+    # over j with pad_size=2 (every (i) row stores both j=0,1), inner
+    # Jagged over k with the same ragged prefix as DJJ.  ptrs2 is indexed
+    # by the Padded level's flat position i * pad_size + pad_j, which
+    # enumerates (0,0), (0,1), (1,0), (1,1) → ptrs2 = [0, 3, 5, 8, 10].
+    coords1 = torch.tensor([[0, 1], [0, 1]], dtype=torch.int64, device=DEVICE)
+    ptrs2 = torch.tensor([0, 3, 5, 8, 10], dtype=torch.int64, device=DEVICE)
+    values = torch.tensor(
+        [1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 0.0, 5.0, 4.0, 6.0], device=DEVICE
+    )
+    return hl.SparseTensor(
+        values=values,
+        shape=_SHAPE_3D,
+        ptrs=(None, None, ptrs2),
+        coords=(None, coords1, None),
     )
 
 
@@ -316,6 +387,8 @@ _SDOT_LAYOUTS = {
     ("Compressed", "Compressed", "Dense"): _build_ccd,
     ("Dense", "Padded", "Dense"): _build_dpd,
     ("Dense", "Dense", "Padded"): _build_ddp,
+    ("Dense", "Jagged", "Jagged"): _build_djj,
+    ("Dense", "Padded", "Jagged"): _build_dpj,
 }
 
 

@@ -69,10 +69,10 @@ from .type_propagation import StackTensorType
 from .type_propagation import TensorType
 from .type_propagation import TileIndexType
 from .type_propagation import TypeInfo
-from .variable_origin import FlattenOrigin
 from .type_propagation import _eval_binary
 from .type_propagation import _eval_compare
 from .type_propagation import _eval_unary
+from .variable_origin import FlattenOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -951,6 +951,8 @@ class WalkDeviceAST(NodeVisitor):
             self._lower_compressed_level(node, inner_type)
         elif fmt == "Padded":
             self._lower_padded_level(node, inner_type)
+        elif fmt == "Jagged":
+            self._lower_jagged_level(node, inner_type)
         else:
             raise AssertionError(f"hl.sparse_tile: unsupported levelformat {fmt!r}")
 
@@ -1129,6 +1131,86 @@ class WalkDeviceAST(NodeVisitor):
             self_coord = hl.load(coord_fake, [self_position])
             env.sparse_tile_position[current_bid] = self_position
             subgraph_walker._assign(node.target, self_coord)
+            subgraph_walker._body(node.body)
+            loop_outputs = self._collect_outputs(subgraph_walker.scope, rw.writes)
+            return loop_outputs.get_tensor_args(), loop_outputs
+
+        self._finish_sparse_loop(inputs, build_subgraph, current_bid, begin=0, end=end)
+
+    def _lower_jagged_level(self, node: ast.For, inner_type: SparseTileType) -> None:
+        """Lower a ``Jagged`` sparse_tile level.
+
+        Jagged mirrors Compressed for storage and masking (same ``ptr``-based
+        variable-length segments, same ``__sparse_lengths`` lift for the
+        jagged masking path), but there is no coord tensor: the coord
+        exposed to the loop body is the local tile index itself, broadcast
+        across the parent shape — ``parent.unsqueeze(-1) * 0 + inner_tile``,
+        matching the Dense lowering's coord pattern. ``self_position``
+        (still ``start + inner_tile``) continues to flow to child levels as
+        the flat index into ``values``.
+        """
+        env = CompileEnvironment.current()
+        bids = inner_type._block_ids
+        current_bid = bids[-1]
+        parent_pos = self._sparse_parent_position(inner_type)
+
+        sparse_tt = inner_type._sparse_tensor_type
+        level_idx = len(bids) - 1
+        ptrs_seq = sparse_tt.element_types["ptrs"]
+        coords_seq = sparse_tt.element_types["coords"]
+        assert isinstance(ptrs_seq, SequenceType)
+        assert isinstance(coords_seq, SequenceType)
+        ptr_t = ptrs_seq.element_types[level_idx]
+        assert isinstance(ptr_t, TensorType), (
+            f"hl.sparse_tile: Jagged level {level_idx} requires a ptrs"
+            f" tensor; got {ptr_t!s}"
+        )
+        assert not isinstance(coords_seq.element_types[level_idx], TensorType), (
+            f"hl.sparse_tile: Jagged level {level_idx} must not ship a coords"
+            f" tensor; got {coords_seq.element_types[level_idx]!s}"
+        )
+        ptr_fake = ptr_t.fake_value
+
+        # Per-parent segment lengths in the OUTER graph, identical to
+        # Compressed.
+        start = hl.load(ptr_fake, [parent_pos])
+        end_ptr = hl.load(ptr_fake, [parent_pos + 1])
+        segment_lengths = end_ptr - start
+        if isinstance(segment_lengths, torch.Tensor) and segment_lengths.ndim >= 2:
+            end = torch.amax(segment_lengths.reshape(-1))
+        else:
+            end = torch.amax(segment_lengths)
+
+        rw: ReadWrites = ReadWrites.from_ast(node)
+        inputs_dict: dict[str, object] = {"__sparse_lengths": segment_lengths}
+        for name in self._rw_names(rw):
+            if (
+                name in self.scope
+                and self.should_become_arg(self.scope[name])
+                and name not in inputs_dict
+            ):
+                inputs_dict[name] = self.scope[name]
+        inputs_dict["__sparse_start"] = start
+        inputs = LiftTensorArgs(inputs_dict)
+        assert inputs.flat_values[0] is segment_lengths
+
+        inner_sym = env.block_sizes[current_bid].var
+
+        def build_subgraph(
+            subgraph_walker: WalkDeviceAST,
+        ) -> tuple[list[object], LiftTensorArgs]:
+            start_ph = subgraph_walker.scope["__sparse_start"]
+            assert isinstance(start_ph, torch.Tensor)
+            inner_tile = hl.tile_index(inner_sym)
+            # self_position: flat index into values, same as Compressed.
+            self_position = start_ph.unsqueeze(-1) + inner_tile
+            # Dense-like coord: tile index broadcast across parent shape.
+            # Using start_ph (already in scope) rather than re-lifting
+            # parent_pos; the ``* 0`` wipes the start offset while
+            # preserving shape/broadcast.
+            coord = start_ph.unsqueeze(-1) * 0 + inner_tile
+            env.sparse_tile_position[current_bid] = self_position
+            subgraph_walker._assign(node.target, coord)
             subgraph_walker._body(node.body)
             loop_outputs = self._collect_outputs(subgraph_walker.scope, rw.writes)
             return loop_outputs.get_tensor_args(), loop_outputs
