@@ -1437,6 +1437,55 @@ def _(node: torch.fx.Node) -> float | bool | None:
     return None
 
 
+@has_side_effect
+@_decorators.api()
+def _custom_mask_augment(block_id: int, mask_tile: object) -> object:
+    """Fold a per-position boolean tile into the current tile's
+    ``mask_{block_id}``.
+
+    Called from per-level lowerings that contribute a custom mask beyond
+    the plain out-of-range check — Bitmap (loaded bitmap slice), Padded
+    (``coord != -1`` sentinel), etc.  Emits ``mask_{block_id} =
+    mask_{block_id}[None, ..., :] & <mask_tile>`` at this position in the
+    generated kernel (no broadcast brackets at the root, where both sides
+    are 1-D).  Everything codegen'd after this point — the user's loop
+    body — picks up the AND'd N-D mask via the standard mask-propagation
+    path; the ``mask_tile`` itself is computed before this statement and
+    therefore sees only the out-of-range component of the mask.
+
+    Returns ``mask_tile`` unchanged (identity passthrough) so the op stays
+    live in FX, and downstream users of its result just reference the
+    mask tile directly.
+    """
+    raise AssertionError("this should never be called")
+
+
+@_decorators.register_fake(_custom_mask_augment)
+def _(block_id: int, mask_tile: object) -> object:
+    return mask_tile
+
+
+@_decorators.codegen(_custom_mask_augment, "common")
+def _(state: CodegenState) -> ast.AST:
+    block_id = state.proxy_arg(0)
+    assert isinstance(block_id, int)
+    mask_var = state.codegen.mask_var(block_id)
+    assert mask_var is not None, (
+        f"_custom_mask_augment: mask_var for block_id {block_id} is None; "
+        "tiles with a custom mask must force a real mask_var in _create_mask."
+    )
+    mask_ast = state.ast_arg(1)
+    env = CompileEnvironment.current()
+    k = len(env.custom_mask_parent_ids[block_id])
+    if k > 0:
+        child_expand = "[" + ", ".join(["None"] * k + [":"]) + "]"
+        stmt_src = f"{mask_var} = ({mask_var}){child_expand} & ({{mask}})"
+    else:
+        stmt_src = f"{mask_var} = ({mask_var}) & ({{mask}})"
+    state.add_statement(statement_from_string(stmt_src, mask=mask_ast))
+    return mask_ast
+
+
 @_decorators.api()
 def _inductor_lowering_extra(args: list[object]) -> torch.Tensor:
     """

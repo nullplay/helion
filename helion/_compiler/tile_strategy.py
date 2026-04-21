@@ -1684,12 +1684,29 @@ class NDTileStrategy(_BaseNDTileStrategy):
             not env.backend.force_tile_mask()
             and env.block_sizes[block_idx].known_multiple(block_size)
             and not env.is_jagged_tile(block_idx)
+            and not env.has_custom_mask(block_idx)
         ):
             self.mask_vars[block_idx] = None
             return None
         self.mask_vars[block_idx] = mask_var = self.fn.new_var(
             f"mask_{block_idx}", dce=True
         )
+
+        if env.has_custom_mask(block_idx):
+            # Tiles with a custom mask (Bitmap load, Padded ``coord != -1``,
+            # ...) need mask_var to always exist so ``_custom_mask_augment``
+            # can AND in the per-position boolean.  The initial expression
+            # here is out-of-range only; the augmentation happens later in
+            # the subgraph at the FX node position of the augment op.
+            # Record the final augmented shape now so indexing_strategy can
+            # expand the mask at use sites via ``jagged_tile_expand_str``.
+            parent_ids = env.custom_mask_parent_ids[block_idx]
+            parent_dims = [env.block_sizes[pid].var for pid in parent_ids]
+            inner_block_size = env.block_sizes[block_idx].var
+            env.custom_mask_shapes[block_idx] = [*parent_dims, inner_block_size]
+            return statement_from_string(
+                f"{mask_var} = ({index_var}) < {{end}}", end=self._to_ast(end)
+            )
 
         if env.is_jagged_tile(block_idx):
             jagged_tile_parents_ast = state.ast_args[3]

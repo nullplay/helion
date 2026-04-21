@@ -1003,6 +1003,11 @@ class SubscriptIndexing(NamedTuple):
                         new_masks.setdefault(
                             f"({mv}){tile_strategy.jagged_tile_expand_str(mask_shape, output_size)}"
                         )
+                    elif env.has_custom_mask(bid):
+                        mask_shape = env.custom_mask_shapes[bid]
+                        new_masks.setdefault(
+                            f"({mv}){tile_strategy.jagged_tile_expand_str(mask_shape, output_size)}"
+                        )
                     else:
                         new_masks.setdefault(
                             f"({mv}){tile_strategy.expand_str(output_size, pos)}"
@@ -1027,7 +1032,11 @@ class SubscriptIndexing(NamedTuple):
                                 new_masks.setdefault(
                                     f"({mv}){tile_strategy.jagged_tile_expand_str(mask_shape, output_size)}"
                                 )
-
+                            elif env.has_custom_mask(bid):
+                                mask_shape = env.custom_mask_shapes[bid]
+                                new_masks.setdefault(
+                                    f"({mv}){tile_strategy.jagged_tile_expand_str(mask_shape, output_size)}"
+                                )
                             else:
                                 new_masks.setdefault(
                                     f"({mv}){tile_strategy.expand_str(output_size, p)}"
@@ -1101,6 +1110,11 @@ class SubscriptIndexing(NamedTuple):
                     ):
                         if env.is_jagged_tile(block_id):
                             mask_shape = env.jagged_tile_mask_shapes[block_id]
+                            expand = tile_strategy.jagged_tile_expand_str(
+                                mask_shape, output_size
+                            )
+                        elif env.has_custom_mask(block_id):
+                            mask_shape = env.custom_mask_shapes[block_id]
                             expand = tile_strategy.jagged_tile_expand_str(
                                 mask_shape, output_size
                             )

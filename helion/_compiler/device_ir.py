@@ -953,6 +953,8 @@ class WalkDeviceAST(NodeVisitor):
             self._lower_padded_level(node, inner_type)
         elif fmt == "Jagged":
             self._lower_jagged_level(node, inner_type)
+        elif fmt == "Bitmap":
+            self._lower_bitmap_level(node, inner_type)
         else:
             raise AssertionError(f"hl.sparse_tile: unsupported levelformat {fmt!r}")
 
@@ -989,6 +991,23 @@ class WalkDeviceAST(NodeVisitor):
             coord_t = coords_seq.element_types[0]
             assert isinstance(coord_t, TensorType)
             loop_var = hl.load(coord_t.fake_value, [position])
+        elif fmt == "Bitmap":
+            # Root Bitmap: coord is ``position`` itself (same as Dense root).
+            # Emit the 1-D bitmap load + mask augmentation as a kernel-
+            # prelude, before the user's loop body walks, so the body picks
+            # up the AND'd ``mask_{bid}`` via the standard mask-propagation
+            # path.  The bitmap load itself runs under the plain out-of-
+            # range mask emitted by ``_create_mask`` at the top of the
+            # kernel, matching the nested-case ordering.
+            bitmaps_seq = inner_type._sparse_tensor_type.element_types["bitmaps"]
+            assert isinstance(bitmaps_seq, SequenceType)
+            bitmap_t = bitmaps_seq.element_types[0]
+            assert isinstance(bitmap_t, TensorType), (
+                "root Bitmap sparse_tile requires bitmaps[0] tensor"
+            )
+            bitmap_tile = hl.load(bitmap_t.fake_value, [position])
+            _tracing_ops._custom_mask_augment(current_bid, bitmap_tile)
+            loop_var = position
         else:
             raise AssertionError(
                 f"unsupported sparse_tile levelformat at root: {fmt!r}"
@@ -1296,6 +1315,13 @@ class WalkDeviceAST(NodeVisitor):
             # is not lifted into inputs_dict but used directly, same pattern
             # as coord_fake in _lower_compressed_level.
             self_coord = hl.load(coord_flat, [self_position])
+            # Sentinel-mask the padding slots (coord == -1) via the shared
+            # custom-mask machinery.  The comparison runs under the plain
+            # out-of-range ``mask_{bid}`` set up by ``_create_mask``; the
+            # augment op folds its result into ``mask_{bid}`` so every
+            # downstream load/store sees the combined OOB + sentinel mask.
+            coord_is_real = self_coord != -1
+            _tracing_ops._custom_mask_augment(current_bid, coord_is_real)
             env.sparse_tile_position[current_bid] = self_position
             subgraph_walker._assign(node.target, self_coord)
             subgraph_walker._body(node.body)
@@ -1304,6 +1330,116 @@ class WalkDeviceAST(NodeVisitor):
 
         self._finish_sparse_loop(
             inputs, build_subgraph, current_bid, begin=0, end=pad_size
+        )
+
+    def _lower_bitmap_level(self, node: ast.For, inner_type: SparseTileType) -> None:
+        """Lower a ``Bitmap`` sparse_tile level.
+
+        Addressing mirrors Dense (``self_position = parent_pos * shape[dim]
+        + inner_tile``, same flat layout into ``values``), but the coord
+        is materialized at the **full** parent shape — not the singleton
+        broadcast Dense/Jagged use — so the rank matches the N-D bitmap
+        tile that will be AND'd into ``mask_{bid}``.
+
+        Inside the subgraph we emit, in order:
+
+        1. ``bitmap_tile = hl.load(bitmap_flat, [self_position])`` — runs
+           under the plain out-of-range mask that ``_create_mask`` sets up
+           at the top of the tile (``index < shape[dim]``); this avoids a
+           self-reference where the bitmap would mask its own load.
+        2. ``_tracing_ops._custom_mask_augment(current_bid, bitmap_tile)``
+           — emits ``mask_{bid} = mask_{bid}[None, ..., :] & bitmap_tile``
+           at this point, so every downstream load/store/reduction that
+           references the tile picks up the N-D augmented mask through
+           the standard mask-propagation path.
+        3. ``_assign(node.target, coord)`` + walk body.
+
+        The bitmap tensor is flattened to 1-D at the kernel boundary via
+        ``FlattenOrigin`` (same trick ``_lower_padded_level`` uses for its
+        coord), so a single N-D ``self_position`` indexes it regardless of
+        parent rank.  Root Bitmap (no parent) keeps the 1-D bitmap as-is.
+        """
+        env = CompileEnvironment.current()
+        bids = inner_type._block_ids
+        current_bid = bids[-1]
+        parent_pos = self._sparse_parent_position(inner_type)
+
+        sparse_tt = inner_type._sparse_tensor_type
+        level_idx = len(bids) - 1
+        shape_seq = sparse_tt.element_types["shape"]
+        assert isinstance(shape_seq, SequenceType)
+        size_d = shape_seq.element_types[inner_type._dim].proxy()
+
+        bitmaps_seq = sparse_tt.element_types["bitmaps"]
+        assert isinstance(bitmaps_seq, SequenceType)
+        bitmap_t = bitmaps_seq.element_types[level_idx]
+        assert isinstance(bitmap_t, TensorType), (
+            f"hl.sparse_tile: Bitmap level {level_idx} requires a bitmaps"
+            f" tensor; got {bitmap_t!s}"
+        )
+        bitmap_fake = bitmap_t.fake_value
+        # Flatten so a single N-D ``self_position`` can index regardless of
+        # parent rank.  The reshape must NOT enter the fx trace (view on a
+        # host tensor is disallowed inside hl.tile); register the flat view
+        # as its own host tensor with FlattenOrigin so tensor_arg emits
+        # ``<bitmap>.reshape(-1)`` at the kernel boundary.  Root Bitmap is
+        # already 1-D and needs no flattening.
+        if bitmap_fake.ndim > 1:
+            host_fn = HostFunction.current()
+            with self.disable_tracing():
+                bitmap_flat = bitmap_fake.reshape(-1)
+            bitmap_origin = host_fn.tensor_to_origin[bitmap_fake]
+            host_fn.tensor_to_origin[bitmap_flat] = FlattenOrigin(bitmap_origin)
+        else:
+            bitmap_flat = bitmap_fake
+
+        rw: ReadWrites = ReadWrites.from_ast(node)
+        inputs_dict: dict[str, object] = {}
+        if isinstance(parent_pos, torch.Tensor):
+            inputs_dict["__sparse_parent_position"] = parent_pos
+        for name in self._rw_names(rw):
+            if (
+                name in self.scope
+                and self.should_become_arg(self.scope[name])
+                and name not in inputs_dict
+            ):
+                inputs_dict[name] = self.scope[name]
+        inputs = LiftTensorArgs(inputs_dict)
+
+        inner_sym = env.block_sizes[current_bid].var
+
+        def build_subgraph(
+            subgraph_walker: WalkDeviceAST,
+        ) -> tuple[list[object], LiftTensorArgs]:
+            inner_tile = hl.tile_index(inner_sym)
+            if isinstance(parent_pos, torch.Tensor):
+                parent_ph = subgraph_walker.scope["__sparse_parent_position"]
+                assert isinstance(parent_ph, torch.Tensor)
+                self_position = parent_ph.unsqueeze(-1) * size_d + inner_tile
+                # Full parent shape (not singleton): keeps coord rank and
+                # sizes aligned with the N-D augmented mask, so consumers
+                # can index with the coord without needing the mask's
+                # broadcast expansion to recover parent extents.
+                coord = inner_tile.broadcast_to(
+                    (*parent_ph.shape, inner_tile.shape[-1])
+                )
+            else:
+                # Root: parent_pos is scalar 0 → self_position is inner_tile
+                # itself, coord is the 1-D inner_tile.
+                self_position = inner_tile
+                coord = inner_tile
+            # Load the bitmap slice BEFORE registering the augmentation so
+            # the load runs under the plain out-of-range ``mask_{bid}``.
+            bitmap_tile = hl.load(bitmap_flat, [self_position])
+            _tracing_ops._custom_mask_augment(current_bid, bitmap_tile)
+            env.sparse_tile_position[current_bid] = self_position
+            subgraph_walker._assign(node.target, coord)
+            subgraph_walker._body(node.body)
+            loop_outputs = self._collect_outputs(subgraph_walker.scope, rw.writes)
+            return loop_outputs.get_tensor_args(), loop_outputs
+
+        self._finish_sparse_loop(
+            inputs, build_subgraph, current_bid, begin=0, end=size_d
         )
 
     def _finish_sparse_loop(

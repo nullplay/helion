@@ -831,6 +831,29 @@ def _sparse_tile_propagation(
         )
         pad_size = coord_t.fake_value.size(-1)
         inner = TileIndexType.allocate(pad_size, origin)
+        # Padded tiles carry a ``coord != -1`` mask augment that is AND'd
+        # into ``mask_{bid}`` via the shared custom-mask machinery.
+        env.register_custom_mask(inner.block_id, parent_block_ids)
+        _add_config_choices([inner.block_id], is_tile=True, allow_static_ranges=[False])
+    elif lvlfmt == "Bitmap":
+        # Fixed bound from shape[dim_val] (like Dense), but with a
+        # per-tile boolean bitmap AND'd into the tile mask. The bitmap
+        # tensor lives in ``bitmaps[level]`` and must be present.
+        level_idx = len(parent_block_ids)
+        bitmaps_seq = sparse_tt.element_types["bitmaps"]
+        assert isinstance(bitmaps_seq, SequenceType), (
+            "hl.sparse_tile: Bitmap level requires SparseTensor.bitmaps"
+        )
+        bitmap_t = bitmaps_seq.element_types[level_idx]
+        assert isinstance(bitmap_t, TensorType), (
+            f"hl.sparse_tile: Bitmap level {level_idx} requires a bitmaps"
+            f" tensor; got {bitmap_t!s}"
+        )
+        shape_seq = sparse_tt.element_types["shape"]
+        assert isinstance(shape_seq, SequenceType)
+        shape_for_dim = shape_seq.element_types[dim_val].proxy()
+        inner = TileIndexType.allocate(shape_for_dim, origin)
+        env.register_custom_mask(inner.block_id, parent_block_ids)
         _add_config_choices([inner.block_id], is_tile=True, allow_static_ranges=[False])
     else:  # Dense — fixed bound from the tensor's shape[dim_val]
         shape_seq = sparse_tt.element_types["shape"]
@@ -887,7 +910,10 @@ def _(state: CodegenState) -> ast.AST:
     assert loop_type == LoopType.GRID, (
         f"inner sparse_tile loops are desugared in device IR; got {loop_type!r}"
     )
-    if inner._levelformat == "Dense":
+    if inner._levelformat in ("Dense", "Bitmap"):
+        # Dense and Bitmap share the grid bound (shape[dim]); the Bitmap
+        # kernel-prelude load + mask augmentation is emitted inside
+        # ``_lower_grid_level`` so the grid launch itself is identical.
         shape_seq = inner._sparse_tensor_type.element_types["shape"]
         assert isinstance(shape_seq, SequenceType)
         size_d = shape_seq.element_types[inner._dim].proxy()

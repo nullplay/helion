@@ -165,6 +165,12 @@ class CompileEnvironment:
         self.specialized_strides: set[tuple[str, int]] = set()
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
+        # Tiles whose ``mask_{bid}`` is augmented with a custom per-position
+        # boolean (Bitmap load, Padded ``coord != -1``, etc.).  Uniform
+        # registry; the downstream mask/index machinery does not care which
+        # level format populated it.
+        self.custom_mask_parent_ids: dict[int, list[int]] = {}
+        self.custom_mask_shapes: dict[int, list[torch.SymInt]] = {}
         self.sparse_tile_position: dict[int, torch.Tensor] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
         self._foreign_symint_cache: dict[tuple[int, sympy.Expr], torch.SymInt] = {}
@@ -1026,6 +1032,12 @@ class CompileEnvironment:
 
     def is_jagged_tile(self, block_id: int) -> bool:
         return block_id in self.jagged_tile_parent_ids
+
+    def register_custom_mask(self, block_id: int, parent_ids: list[int]) -> None:
+        self.custom_mask_parent_ids[block_id] = parent_ids
+
+    def has_custom_mask(self, block_id: int) -> bool:
+        return block_id in self.custom_mask_parent_ids
 
 
 class NoCurrentEnvironment(RuntimeError):
