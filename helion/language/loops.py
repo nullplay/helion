@@ -918,22 +918,22 @@ def _(state: CodegenState) -> ast.AST:
         assert isinstance(shape_seq, SequenceType)
         size_d = shape_seq.element_types[inner._dim].proxy()
     elif inner._levelformat == "Compressed":
-        ptrs_seq = inner._sparse_tensor_type.element_types["ptrs"]
-        assert isinstance(ptrs_seq, SequenceType)
-        ptrs0_t = ptrs_seq.element_types[0]
-        assert isinstance(ptrs0_t, TensorType)
-        ptrs0_host = ptrs0_t.origin.host_str()
-        size_d = expr_from_string(f"({ptrs0_host}[1] - {ptrs0_host}[0]).item()")
-    elif inner._levelformat == "Padded":
-        # Pad width is the trailing dim of coords[0]; at the root the coord
-        # is simply shape (pad_size,), so ``size(-1)`` returns that directly.
+        # Bound is the nnz-rows count, which equals ``coords[0].size(0)``.
+        # Using the SymInt (rather than a raw ``ptrs[1]-ptrs[0]`` AST) lets
+        # Helion's sympy arg-hoisting route it through ``_lift_sympy_arg``
+        # so the same identifier is visible on both host (grid launch) and
+        # device (mask).  A raw AST is not hoisted and leaks the host name
+        # ``A.coords[0]`` into device code.
         coords_seq = inner._sparse_tensor_type.element_types["coords"]
         assert isinstance(coords_seq, SequenceType)
-        coord0_t = coords_seq.element_types[0]
-        assert isinstance(coord0_t, TensorType)
-        coord0_host = coord0_t.origin.host_str()
-        size_d = expr_from_string(f"{coord0_host}.size(-1)")
+        coord_t = coords_seq.element_types[0]
+        assert isinstance(coord_t, TensorType)
+        size_d = coord_t.fake_value.size(0)
     else:
+        # Padded and Jagged are forbidden at the root: neither has a
+        # meaningful semantics without a parent position to specialize
+        # against (Padded would be just a relabelled Dense; Jagged would
+        # have nothing to segment).
         raise AssertionError(
             f"unsupported sparse_tile levelformat at root: {inner._levelformat!r}"
         )

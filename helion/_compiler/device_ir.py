@@ -983,14 +983,6 @@ class WalkDeviceAST(NodeVisitor):
             coord_t = coords_seq.element_types[0]
             assert isinstance(coord_t, TensorType)
             loop_var = hl.load(coord_t.fake_value, [position])
-        elif fmt == "Padded":
-            # At the root the pad coord is shape (pad_size,) so a direct
-            # load by ``position`` works (no flatten needed).
-            coords_seq = inner_type._sparse_tensor_type.element_types["coords"]
-            assert isinstance(coords_seq, SequenceType)
-            coord_t = coords_seq.element_types[0]
-            assert isinstance(coord_t, TensorType)
-            loop_var = hl.load(coord_t.fake_value, [position])
         elif fmt == "Bitmap":
             # Root Bitmap: coord is ``position`` itself (same as Dense root).
             # Emit the 1-D bitmap load + mask augmentation as a kernel-
@@ -1062,16 +1054,13 @@ class WalkDeviceAST(NodeVisitor):
                 parent_ph = subgraph_walker.scope["__sparse_parent_position"]
                 assert isinstance(parent_ph, torch.Tensor)
                 # parent_ph has shape (P0, ..., P_{k-1}); broadcast a trailing
-                # axis with inner_tile (shape (P_k,)) to get (..., P_k).
+                # axis with inner_tile (shape (P_k,)) to get (..., P_k) for
+                # the .value load path.
                 self_position = parent_ph.unsqueeze(-1) * size_d + inner_tile
-                # Singleton-broadcast coord: advertise parent rank via size-1
-                # dims so NumPy broadcasting recovers the parent-shaped result
-                # at consumer sites, while the coord itself never materializes
-                # the parent axes. Use the parent tile (not the coord) as the
-                # authoritative source for ancestor-dim sizes.
-                coord = inner_tile.broadcast_to(
-                    (*((1,) * parent_ph.ndim), inner_tile.shape[-1])
-                )
+                # Dense coord tile is pure 1-D: just the self-axis tile index.
+                # Parent inheritance happens only through .value / non-Dense
+                # children, not through the Dense tile itself.
+                coord = inner_tile
             else:
                 # root: parent_pos is scalar 0 -> self_position == inner_tile
                 self_position = inner_tile
