@@ -2217,7 +2217,10 @@ class WalkDeviceAST(NodeVisitor):
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
         # ``tile_k.value`` on a leaf SparseTile expands to a load of the
-        # flat ``values`` array at this level's accumulated `position`.
+        # ``values`` array at this level's accumulated `position`. For a
+        # block payload (``values`` rank > 1) the index covers axis 0 with
+        # ``position`` and spans every trailing payload axis with a full
+        # slice, so the result is ``(*coord_shape, *value_shape)``.
         # Type propagation has already validated that this is a leaf.
         if node.attr == "value" and isinstance(node.value, ExtendedAST):
             value_type = node.value._type_info
@@ -2226,7 +2229,10 @@ class WalkDeviceAST(NodeVisitor):
                 position = env.sparse_tile_position[value_type._block_ids[-1]]
                 values_t = value_type._sparse_tensor_type.element_types["values"]
                 assert isinstance(values_t, TensorType)
-                return hl.load(values_t.fake_value, [position])
+                payload_ndim = values_t.fake_value.ndim - 1
+                index: list[object] = [position]
+                index.extend(slice(None) for _ in range(payload_ndim))
+                return hl.load(values_t.fake_value, index)
         return getattr(self.visit(node.value), node.attr)
 
     def visit_Expr(self, node: ast.Expr) -> object:

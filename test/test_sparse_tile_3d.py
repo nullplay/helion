@@ -287,15 +287,13 @@ def _build_sparse_3d(fmt0: str, fmt1: str, fmt2: str) -> hl.SparseTensor:
     else:
         raise AssertionError(fmt2)
 
-    kwargs = dict(
+    return hl.SparseTensor(
         values=values,
         shape=_SHAPE_3D,
         ptrs=(ptrs0, ptrs1, ptrs2),
         coords=(coords0, coords1, coords2),
+        bitmaps=(bitmaps0, bitmaps1, bitmaps2),
     )
-    if any(b is not None for b in (bitmaps0, bitmaps1, bitmaps2)):
-        kwargs["bitmaps"] = (bitmaps0, bitmaps1, bitmaps2)
-    return hl.SparseTensor(**kwargs)
 
 
 @helion.kernel(config=helion.Config(block_sizes=[4, 4, 8]))
@@ -376,7 +374,6 @@ class TestSparseTile3D(TestCase):
                 fmt0, fmt1, fmt2 = fmt
                 got = sdot_kernel(A, _X, fmt0, fmt1, fmt2)
                 torch.testing.assert_close(got, expected)
-
 
 if __name__ == "__main__":
     unittest.main()

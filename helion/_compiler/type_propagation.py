@@ -206,6 +206,13 @@ class TypeInfo:
                 k: cls.from_example(getattr(value, k), AttributeOrigin(origin, k))
                 for k in keys
             }
+            # Expose payload-shape / leaf-count as first-class attributes.
+            # These are @property on the dataclass; propagate them like real
+            # fields so user kernels can read them without touching ``values``.
+            for synthetic in ("value_shape", "nnz"):
+                element_types[synthetic] = cls.from_example(
+                    getattr(value, synthetic), AttributeOrigin(origin, synthetic)
+                )
             return SparseTensorType(origin, element_types)
         if isinstance(value, torch.Tensor):
             # TODO(jansel): need to wrap this in a fake tensor
@@ -1566,14 +1573,17 @@ class SparseTensorType(ClassType):
     automatically registered in ``HostFunction.tensor_to_origin`` via
     ``DictType.populate_symbol_origins``.  Internal compiler code can read them
     through ``element_types[...]``; user code cannot, because we override
-    ``propagate_attribute`` to allow only ``shape``.
+    ``propagate_attribute`` to allow only ``shape`` / ``value_shape`` / ``nnz``.
     """
 
+    _USER_ATTRS = ("shape", "value_shape", "nnz")
+
     def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
-        if attr == "shape":
+        if attr in self._USER_ATTRS:
             return super().propagate_attribute(attr, origin)
         raise exc.TypeInferenceError(
-            f"SparseTensor exposes only `.shape` to user code; got `.{attr}`."
+            f"SparseTensor exposes only {self._USER_ATTRS} to user code;"
+            f" got `.{attr}`."
             " Use `hl.sparse_tile(...)` to iterate over the sparse structure."
         )
 
@@ -1658,7 +1668,12 @@ class SparseTileType(TensorType):
                 )
             values_t = self._sparse_tensor_type.element_types["values"]
             assert isinstance(values_t, TensorType)
-            fake = values_t.fake_value.new_empty(self.fake_value.shape)
+            # values has shape (nnz, *value_shape); .value picks up one entry
+            # per leaf coord so the result is (*coord_shape, *value_shape).
+            payload_shape = values_t.fake_value.shape[1:]
+            fake = values_t.fake_value.new_empty(
+                [*self.fake_value.shape, *payload_shape]
+            )
             return TensorType(origin, fake)
         return super().propagate_attribute(attr, origin)
 

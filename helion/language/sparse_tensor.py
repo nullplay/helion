@@ -13,10 +13,15 @@ class SparseTensor:
 
     Storage is uniform across formats:
 
-    * ``values`` is always a flat 1-D tensor of length ``nnz`` (the total
-      number of leaf positions). The way to turn a user-visible multi-axis
-      value into a flat position is determined by the per-level lowering,
-      so the same flat array works for DD / DC / CD / CC / ... .
+    * ``values`` is a tensor of shape ``(nnz, *value_shape)``. Each leaf
+      position in the coordinate tree owns one block of shape
+      ``value_shape``; when ``value_shape == ()`` the block degenerates to
+      a scalar (so ``values`` is flat of length ``nnz``). Leaf positions
+      are laid out along axis 0 in the order determined by the per-level
+      lowering, so the same storage works for DD / DC / CD / CC / ... .
+      The payload shape is inferred from ``values.shape[1:]`` and is
+      exposed to user code as ``A.value_shape``; the leaf count is
+      exposed as ``A.nnz``.
     * ``shape`` is positional: ``shape[d]`` is the size of dim ``d``.
     * ``ptrs`` / ``coords`` / ``bitmaps`` have length ``len(shape)`` and
       are aligned to **tensor level order** (outer → inner in the user's
@@ -52,7 +57,7 @@ class SparseTensor:
     arrays the chosen formats need.
     """
 
-    values: torch.Tensor  # flat, length nnz
+    values: torch.Tensor  # shape (nnz, *value_shape); flat when value_shape == ()
     shape: tuple[int, ...]
     # length == len(shape); None for Dense (and for Padded's ptrs slot,
     # and for Jagged's coords slot, and for Bitmap's ptrs/coords slots),
@@ -64,3 +69,13 @@ class SparseTensor:
     # store a torch.bool tensor of shape
     # ``(len(parent's storage), shape[level])`` (root: ``(shape[0],)``).
     bitmaps: tuple[torch.Tensor | None, ...] = ()
+
+    @property
+    def value_shape(self) -> tuple[int, ...]:
+        """Per-leaf payload shape. ``()`` means scalar payload."""
+        return tuple(self.values.shape[1:])
+
+    @property
+    def nnz(self) -> int:
+        """Number of stored leaf positions (``values.shape[0]``)."""
+        return int(self.values.shape[0])

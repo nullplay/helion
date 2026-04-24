@@ -180,15 +180,13 @@ def _build_sparse_2d(fmt0: str, fmt1: str) -> hl.SparseTensor:
     else:
         raise AssertionError(fmt1)
 
-    kwargs = dict(
+    return hl.SparseTensor(
         values=values,
         shape=_SHAPE,
         ptrs=(ptrs0, ptrs1),
         coords=(coords0, coords1),
+        bitmaps=(bitmaps0, bitmaps1),
     )
-    if bitmaps0 is not None or bitmaps1 is not None:
-        kwargs["bitmaps"] = (bitmaps0, bitmaps1)
-    return hl.SparseTensor(**kwargs)
 
 
 @helion.kernel(config=helion.Config(block_sizes=[4, 4, 8]))
@@ -235,6 +233,58 @@ def spmm_dense_inner(
     return C
 
 
+# ----------------------------------------------------------------------------
+# Dense-root contract demonstration.
+#
+# 3x3 fixture in which row 1 is logically empty (the user's intended math
+# is ``[[1,2,3],[0,0,0],[4,5,6]]``) but storage at row 1 is filled with
+# ``_GARBAGE`` — what a naive user leaves there when they mistakenly
+# assume the format will "skip" that row:
+#
+#     stored = [[1,  2,  3 ],
+#               [G,  G,  G ],     <- user thinks this is absent
+#               [4,  5,  6 ]]
+#
+# We re-encode this same logical matrix under three root formats (Dense,
+# Compressed, Bitmap) with a Dense inner, and observe:
+#
+#   Dense   root → no mask; row 1's G leaks into the output → WRONG.
+#   Compressed root → row 1 is elided from storage; Dense inner sees only
+#                     rows 0 and 2 → correct.
+#   Bitmap  root → row 1's G lives in storage but the root bitmap masks
+#                  it at load time → correct.
+#
+# The lesson: Dense is a user-to-compiler promise that "storage IS the
+# math at this level."  Compressed/Bitmap ancestors can rescue a broken
+# promise by pruning the garbage before Dense ever sees it.
+# ----------------------------------------------------------------------------
+
+_CONTRACT_SHAPE = (3, 3)
+_CONTRACT_N = 4
+_CONTRACT_STORED = torch.tensor(
+    [
+        [1.0, 2.0, 3.0],
+        [_GARBAGE, _GARBAGE, _GARBAGE],
+        [4.0, 5.0, 6.0],
+    ],
+    device=DEVICE,
+)
+_CONTRACT_INTENDED = torch.tensor(
+    [
+        [1.0, 2.0, 3.0],
+        [0.0, 0.0, 0.0],
+        [4.0, 5.0, 6.0],
+    ],
+    device=DEVICE,
+)
+_CONTRACT_B = (
+    torch.arange(3 * _CONTRACT_N, dtype=torch.float32, device=DEVICE).reshape(
+        3, _CONTRACT_N
+    )
+    * 0.1
+)
+
+
 class TestSparseTile2D(TestCase):
     def test_spmm_all_layouts(self) -> None:
         expected = _DENSE_A @ _B
@@ -252,6 +302,56 @@ class TestSparseTile2D(TestCase):
                     else:
                         got = spmm_sparse_inner(A, _B, fmt0, fmt1)
                         torch.testing.assert_close(got, expected)
+
+    def test_dense_root_leaks_garbage(self) -> None:
+        """Dense root has no mask; row 1's garbage leaks into the output."""
+        A = hl.SparseTensor(
+            values=_CONTRACT_STORED.flatten(),
+            shape=_CONTRACT_SHAPE,
+            ptrs=(None, None),
+            coords=(None, None),
+            bitmaps=(None, None),
+        )
+        got = spmm_dense_inner(A, _CONTRACT_B, "Dense")
+        expected = _CONTRACT_INTENDED @ _CONTRACT_B
+        self.assertFalse(torch.allclose(got, expected, rtol=1e-2, atol=1e-2))
+
+    def test_compressed_root_elides_garbage_row(self) -> None:
+        """Compressed root lists only rows 0 and 2; row 1's garbage is
+        never in storage, so Dense inner can't leak it."""
+        # nnz rows only: 0 and 2.  values = [row 0 | row 2] flattened.
+        values = torch.tensor(
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], device=DEVICE
+        )
+        ptrs0 = torch.tensor([0, 2], dtype=torch.int64, device=DEVICE)
+        coords0 = torch.tensor([0, 2], dtype=torch.int64, device=DEVICE)
+        A = hl.SparseTensor(
+            values=values,
+            shape=_CONTRACT_SHAPE,
+            ptrs=(ptrs0, None),
+            coords=(coords0, None),
+            bitmaps=(None, None),
+        )
+        got = spmm_dense_inner(A, _CONTRACT_B, "Compressed")
+        expected = _CONTRACT_INTENDED @ _CONTRACT_B
+        torch.testing.assert_close(got, expected, rtol=1e-2, atol=1e-2)
+
+    def test_bitmap_root_masks_garbage_row(self) -> None:
+        """Bitmap root keeps row 1 in storage (garbage and all) but the
+        bitmap masks its load, so Dense inner accumulates zero for that
+        row."""
+        bitmap = torch.tensor([True, False, True], dtype=torch.bool, device=DEVICE)
+        A = hl.SparseTensor(
+            values=_CONTRACT_STORED.flatten(),
+            shape=_CONTRACT_SHAPE,
+            ptrs=(None, None),
+            coords=(None, None),
+            bitmaps=(bitmap, None),
+        )
+        got = spmm_dense_inner(A, _CONTRACT_B, "Bitmap")
+        expected = _CONTRACT_INTENDED @ _CONTRACT_B
+        torch.testing.assert_close(got, expected, rtol=1e-2, atol=1e-2)
+
 
 
 if __name__ == "__main__":
