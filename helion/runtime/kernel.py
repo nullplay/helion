@@ -2633,6 +2633,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 _maybe_skip_dtype_check_in_meta_registrations(),
                 patch_inductor_lowerings(),
                 measure("BoundKernel.create_host_function"),
+                self.env.use_runtime_arg_values(
+                    dict(zip(self.kernel.signature.parameters, args, strict=False))
+                    if self.settings.backend == "cute"
+                    else {},
+                    capture_metadata=self.settings.backend == "cute",
+                ),
             ):
                 try:
                     compiler = KernelCompiler(self.env)
@@ -2759,7 +2765,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                             self.env.config_spec.compiler_seed_configs.append(
                                 seed_config
                             )
-                with self.env.use_runtime_arg_values(runtime_args):
+                with self.env.use_runtime_arg_values(runtime_args), self.host_function:
                     register_compiler_coverage_groups(
                         self.env, self.host_function.device_ir
                     )
