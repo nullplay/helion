@@ -29,6 +29,7 @@ from torch._inductor.utils import IndentedBuffer
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.functions import Identity
 from torch.utils._sympy.value_ranges import ValueRanges
 from torch.utils._sympy.value_ranges import bound_sympy
 
@@ -171,6 +172,7 @@ class HelionCSEProxy(CSEProxy):
         symbol = super().indirect_indexing(var, size, check, wrap_neg)
         # Named after var or its wrap, both CSE variables.
         kernel.indirect[symbol] = kernel.cse.varname_map[symbol.name]
+        kernel.indirect_sizes[symbol] = sympy.sympify(size)
         return symbol
 
     def dot(self, x: CSEVariable, y: CSEVariable) -> CSEVariable:
@@ -296,8 +298,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.outer_stores: dict[str, CSEVariable] = {}
         # Whether an indirect index needs a bounds check; see check_bounds().
         self.needs_bounds_check = False
-        # The values indices read, by the symbols that stand for them.
+        # The values indices read, by the symbols that stand for them, and the
+        # size of the dim each indexes.
         self.indirect: dict[sympy.Symbol, CSEVariable] = {}
+        self.indirect_sizes: dict[sympy.Symbol, sympy.Expr] = {}
 
     def __enter__(self) -> Self:
         if self.mix_order_reduction and "y" not in self.symbols:
@@ -524,13 +528,23 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             if shape == tuple(arg.shape or ()):
                 return arg
             line = f"{arg}.reshape([{self.dims_code(shape)}])"
-            return self.cse.generate(self.compute, line, dtype=arg.dtype, shape=shape)
+            # Its values' ranges, which a reshape keeps, for HelionOverrides.where().
+            return self.cse.generate(
+                self.compute, line, bounds=arg.bounds, dtype=arg.dtype, shape=shape
+            )
 
         return tuple(map(align, args))
 
     def tile_index(self, index: sympy.Expr) -> sympy.Expr:
-        """`index` over the range tree roots, i.e. the tile indices."""
-        index = sympy.sympify(index)
+        """`index` over the range tree roots, i.e. the tile indices. Without
+        Identity, which Inductor wraps around a term to keep it from being
+        simplified, as cat's lowering does: x[:, :50] of cat([x, y], -1) reads
+        x at 100*y0 + Identity(x1), which no view of x matches, and the load
+        would be flat:
+            tmp5 = hl.load(in0, [100*tile_y.index.reshape([tile_y, 1])
+                + (tile_x.index)], extra_mask=tmp4)
+        rather than tmp5 = in0[tile_y, tile_x]."""
+        index = sympy.sympify(index).replace(Identity, lambda arg: arg)
         entries: dict[sympy.Expr, sympy.Expr] = {
             symbol: self.range_tree_nodes[symbol].expr
             for symbol in index.free_symbols
@@ -567,29 +581,49 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self, buffer: IRNode, index: sympy.Expr, axes: Sequence[str]
     ) -> IRNode | None:
         """A view of `buffer` with one dim per axis in `axes`, if `index` is affine
-        in those tiles and the view stays inside the storage."""
-        layout = buffer.get_layout()
+        in those tiles and the view stays inside the storage (affine_view())."""
+        return self.affine_view(
+            buffer,
+            index,
+            [self.symbols[axis] for axis in axes],
+            [self.extents[axis] for axis in axes],
+        )
+
+    def affine_view(
+        self,
+        buffer: IRNode,
+        index: sympy.Expr,
+        symbols: Sequence[sympy.Expr],
+        sizes: Sequence[sympy.Expr],
+    ) -> IRNode | None:
+        """A view of `buffer` with a dim of each of `sizes` along each of
+        `symbols`, if `index` is affine in them and the view stays inside the
+        storage: its strides are the symbols' coefficients and its offset the
+        rest of the index."""
         expanded = sympy.expand(index)
-        sizes = [self.extents[axis] for axis in axes]
-        strides = [expanded.coeff(self.symbols[axis]) for axis in axes]
-        offset = expanded.xreplace({self.symbols[axis]: 0 for axis in self.axes})
+        strides = [expanded.coeff(symbol) for symbol in symbols]
+        offset = expanded.xreplace(dict.fromkeys(symbols, sympy.S.Zero))
         if not all(
             isinstance(value, (int, sympy.Integer))
             for value in (*sizes, *strides, offset)
         ):
             return None
         expected = offset + sum(
-            self.symbols[a] * s for a, s in zip(axes, strides, strict=True)
+            symbol * stride for symbol, stride in zip(symbols, strides, strict=True)
         )
         end = offset + sum(
-            (size - 1) * stride for size, stride in zip(sizes, strides, strict=True)
+            # pyrefly: ignore [unsupported-operation]
+            (size - 1) * stride
+            for size, stride in zip(sizes, strides, strict=True)
         )
         # The storage size can be symbolic, e.g. x[0] @ w with x [s, 40, 72] and a
         # dynamic s: end = 2879 < 2880 * s holds since s >= 2.
         if (
             offset < 0
             or any(stride < 0 for stride in strides)
-            or not V.graph.sizevars.statically_known_lt(end, layout.storage_size())
+            or not V.graph.sizevars.statically_known_lt(
+                end, buffer.get_layout().storage_size()
+            )
             or not V.graph.sizevars.statically_known_equals(index, expected)
         ):
             return None
@@ -681,7 +715,55 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             arg = self.tensor_arg(view, output=output)
             self.note_row(arg, coordinates)
             return arg, coordinates, tiles
+        if not output and (gather := self.gather_subscript(buffer, index, axes)):
+            return gather
         return self.flat_subscript(buffer, index, axes, output=output)
+
+    def gather_subscript(
+        self, buffer: IRNode, index: sympy.Expr, axes: Sequence[str]
+    ) -> tuple[HelionTensorArg, list[str], TileShape] | None:
+        """The parameter, subscript and shape that read `buffer` at an index of
+        one value i, as in w[i] of an embedding table w [V, E]: a view of the
+        storage whose first dim i indexes and whose other dims are tiles the
+        value does not have. Read at 1024*tmp1 + r, with tmp1 = i[tile_y,
+        tile_x], the flat subscript
+            in1[hl.arange(1024) + 1024*tmp1.reshape([tile_y, tile_x, 1])]
+        becomes the [V, 1024] view of w subscripted by the value and the row:
+            in1[tmp1, :]
+        whose loads of a row's consecutive elements the backend can vectorize.
+        Helion puts the value's tiles first in the result, then the other
+        tiles, so those must come after the value's in the kernel's axis
+        order; and an index that also reads one of the value's tiles, as in
+        x.gather(1, i), is a gather along a tile, which stays flat."""
+        indirect = self.indirect_vars(index)
+        if len(indirect) != 1:
+            return None
+        ((symbol, value),) = indirect.items()
+        size = self.indirect_sizes.get(symbol)
+        # Helion keeps a size-1 dim of the value: tmp1 of [tile_y, 1] would
+        # read [tile_y, 1, tile_x] beside the kernel's [tile_y, tile_x].
+        if any(str(dim) == "1" for dim in value.shape or ()):
+            return None
+        value_axes = tile_axes(value.shape)
+        other = [axis for axis in axes if axis not in value_axes]
+        if (
+            size is None
+            or not value_axes
+            or [axis for axis in self.axes if axis in axes] != [*value_axes, *other]
+            or any(self.symbols[axis] in index.free_symbols for axis in value_axes)
+        ):
+            return None
+        view = self.affine_view(
+            buffer,
+            index,
+            [symbol, *(self.symbols[axis] for axis in other)],
+            [size, *(self.extents[axis] for axis in other)],
+        )
+        if view is None:
+            return None
+        tiles = [TILE_NAMES[axis] for axis in other]
+        coordinates = [str(value), *map(self.coordinate, tiles)]
+        return self.tensor_arg(view), coordinates, self.value_shape(axes)
 
     def note_row(self, arg: HelionTensorArg, coordinates: list[str]) -> None:
         """Keep the first full row of an input (in0[tile_x, :]) as the row
@@ -1120,6 +1202,19 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         body: Callable[[], CSEVariable],
         other: bool | float,
     ) -> CSEVariable:
+        """body() where `mask` is true, else `other`; body() alone when the
+        node's value ranges prove `mask` true, as for the tile_x.index < 100
+        of (torch.cat([x, y], -1) * 2)[:, :50] over tiles of x < 50 only,
+        where the masked load
+            tmp4 = tmp0 < tmp3
+            tmp5 = hl.load(in0, [100*tile_y.index.reshape([tile_y, 1])
+                + (tile_x.index)], extra_mask=tmp4)
+            tmp6 = hl.full([], 0.0, dtype=torch.float32)
+            tmp7 = torch.where(tmp4, tmp5, tmp6)
+        becomes tmp5 = in0[tile_y, tile_x], with no where."""
+        bounds = mask.bounds
+        if bounds.is_bool and bounds.is_singleton() and bool(bounds.lower):
+            return body()
         self.load_masks.append(mask)
         try:
             result = body()
@@ -1127,6 +1222,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             self.load_masks.pop()
         if result.dtype is None:
             raise AssertionError(f"expected a dtype for masked value {result}")
+        if bounds.is_bool and bounds.is_singleton():
+            # Proven false, as cat's mask for the sink over those tiles: the
+            # value is `other`, and Helion drops the body's unused loads.
+            return V.ops.constant(other, result.dtype)
         return V.ops.where(mask, result, V.ops.constant(other, result.dtype))
 
     def check_bounds(
