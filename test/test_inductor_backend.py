@@ -857,10 +857,10 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
     )
     def test_persistent_reduction(self, case):
         # argmax: the row's indices are hl.arange(rdim), with rdim the dim of
-        # a factory of 300 elements beside tile_x, which is the reduction dim
-        # of in0[tile_x, :] (HelionKernel.row_dim()); a NaN, ties and a row of
-        # -inf as in test_arg_reduction. pow2: a row of 128 is a dim of its
-        # own size. few: a row of 12, not a power of two, keeps a loop of one
+        # a factory's row, hl.zeros([tile_x, 300]), as a row of up to 1024
+        # stays one block (HelionKernel.codegen_rdim()); a NaN, ties and a row
+        # of -inf as in test_arg_reduction. pow2: a row of 128 is named rdim
+        # too, not 128. few: a row of 12, not a power of two, keeps a loop of one
         # block, even under choices that make every reduction persistent
         # (names_row_dim()). welford: test_welford_extremes' rows in one block
         # each, whose weight is R.
@@ -902,7 +902,7 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         self.assertEqual("acc" in source, case == "few")
         line = {
             "argmax": "rdim = hl.zeros([tile_x, 300]).size(1)",
-            "pow2": "hl.arange(128)",
+            "pow2": "hl.arange(rdim)",
             "few": "for tile_r in hl.tile(12):",
             "welford": "hl.full([], 963.0, dtype=torch.float32)",
             "neg_inf_row": "tmp0 = in0[tile_x, :]",
@@ -910,7 +910,37 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
             "pad": "[300*tile_x.index.reshape([tile_x, 1]) + (hl.arange(rdim))]",
         }[case]
         self.assertIn(line, source)
-        self.assertEqual("rdim" in source, case in ("argmax", "broadcast", "pad"))
+        self.assertEqual(
+            "rdim" in source, case in ("argmax", "pow2", "broadcast", "pad")
+        )
+
+    def test_long_row_reduction(self):
+        # A sum over a row of 4096, past Triton's 1024 for a persistent row,
+        # reads the row as one block, which Helion can roll into a loop
+        # (Config.reduction_loops); var_mean keeps its loop, which combines
+        # each block into the Welford accumulators as it reads it.
+        x = torch.randn(64, 4096, device=DEVICE)
+        (source,) = self.compile(lambda x: x.sum(-1), x, tol=1e-3)
+        self.assertIn("tmp0 = in0[tile_x, :]", source)
+        self.assertNotIn("for tile_r", source)
+        (source,) = self.compile(lambda x: torch.var_mean(x, -1), x, tol=1e-4)
+        self.assertIn("for tile_r in hl.tile(4096):", source)
+
+    def test_long_unnamed_row(self):
+        # A row of 2**21, past MAX_PERSISTENT_ROW, unsplit, that only a flipped
+        # (flat) load reads: no full row of an operand names its dim, and a
+        # factory of 2**21 does not compile, so it keeps a loop over tile_r.
+        x = torch.randn(2, 2**21, device=DEVICE)
+        with config.patch(split_reductions=False):
+            (source,) = self.compile(lambda x: x.flip(-1).sum(-1), x, tol=1e-2)
+        self.assertIn("for tile_r in hl.tile(2097152):", source)
+        # A flipped row of 100000, past UNROLLED_ROW_MAX: no input's full row
+        # names it, and a factory's dim would make each row one block of
+        # 131072 lanes, so it loops over tile_r too.
+        x = torch.randn(4, 100000, device=DEVICE)
+        with config.patch(split_reductions=False):
+            (source,) = self.compile(lambda x: x.flip(-1).sum(-1), x, tol=1e-2)
+        self.assertIn("for tile_r in hl.tile(100000):", source)
 
     def test_permuted_copy_and_epilogue(self):
         # y = x.permute(0, 2, 3, 1).contiguous() and y * 2: one kernel, whose
