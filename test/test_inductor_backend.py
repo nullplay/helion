@@ -1226,6 +1226,16 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         a, b = torch.ones(8, 2100, device=DEVICE), torch.ones(8, 900, device=DEVICE)
         self.compile(lambda a, b: torch.cat([a, b], -1).sum(-1), a, b)
 
+    def test_nchw_var_mean(self):
+        # var_mean over N, H and W of an NCHW tensor reduces each row of H * W
+        # contiguous values as a tile first (split_strided_reductions()),
+        # then N.
+        x = torch.randn(8, 16, 32, 32, device=DEVICE)
+        sources = self.compile(
+            lambda x: torch.var_mean(x, [0, 2, 3], correction=0), x, tol=1e-4
+        )
+        self.assertIn("tmp0 = in0[tile_y, tile_x, :]", sources[0])
+
     def test_column_sum(self):
         # A column sum with enough columns not to split, which Inductor hints
         # DEFAULT: its tiling scores put the contiguous bytes along x, so the
