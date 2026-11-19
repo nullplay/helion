@@ -990,14 +990,16 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         # Tiles over the dims the indexes divide the flat ranges by, with no
         # // or % (natural_tiling()). mean: the mean over H and W of a
         # channels-last x, read at 64*r + 2304*(x // 64) + x % 64 by the
-        # 1-D tiling. broadcast: w[c] beside x[n, c], read at x % 384.
+        # 1-D tiling, an outer reduction, whose contiguous C is the last dim of
+        # the tile. broadcast: w[c] beside x[n, c], read at x % 384.
         # mask: the column and row, x % 100 and x // 100, of a causal mask.
         if case == "mean":
             x = torch.randn(8, 64, 6, 6, device=DEVICE)
             x = x.to(memory_format=torch.channels_last)
             (source,) = self.compile(lambda x: x.mean([2, 3]), x, tol=1e-4)
             self.assertIn("for tile_y, tile_x in hl.tile([8, 64]):", source)
-            self.assertIn("in0[tile_y, tile_x, :]", source)
+            self.assertIn("in0[tile_y, :, tile_x]", source)
+            self.assertIn("torch.sum(tmp0, -2)", source)
         elif case == "broadcast":
             x = torch.randn(32, 384, device=DEVICE)
             w = torch.randn(384, device=DEVICE)
@@ -1201,6 +1203,29 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         with V.set_choices_handler(Choices()):
             sources = self.compile(lambda x: torch.var_mean(x, -1), x)
         self.assertEqual(len(sources), 2)
+
+    def test_column_sum(self):
+        # A column sum with enough columns not to split, which Inductor hints
+        # DEFAULT: its tiling scores put the contiguous bytes along x, so the
+        # row is the first dim of the tile and x, of stride 1, the last
+        # (reads_outer_rows()), not in0[tile_x, :].
+        x = torch.randn(64, 32768, device=DEVICE)
+        (source,) = self.compile(lambda x: x.sum(0), x, tol=1e-4)
+        self.assertIn("tmp0 = in0[:, tile_x]", source)
+        self.assertIn("torch.sum(tmp0, -2)", source)
+
+    def test_split_reduction_chunks(self):
+        # Inductor cuts the column sum over 100000 rows into 782 chunks of 128,
+        # the last past the end of the rows, which masks every load of the
+        # first kernel; HelionChoices.reduction_split_factor() picks 800 chunks
+        # of 125, whose loads are tiles of a view of x, with x's contiguous dim
+        # last (an outer reduction).
+        x = torch.randn(100000, 96, device=DEVICE)
+        # The sums of 100000 values, in chunks, differ from eager's by 1e-4.
+        first, _ = self.compile(lambda x: x.sum(0), x, tol=1e-3)
+        self.assertIn("for tile_y, tile_x in hl.tile([800, 96]):", first)
+        self.assertIn("for tile_r in hl.tile(125):", first)
+        self.assertIn("tmp0 = in0[tile_y, tile_r, tile_x]", first)
 
     def test_welford_layer_norm(self):
         # bf16 with its affine epilogue, in one kernel.

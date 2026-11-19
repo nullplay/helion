@@ -22,6 +22,7 @@ from .support import numerics_modes
 from .support import python_wrapper
 
 if TYPE_CHECKING:
+    import torch
     from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
     from torch._inductor.ir import IRNode
     from torch._inductor.scheduler import BaseSchedulerNode
@@ -129,9 +130,10 @@ class HelionChoices(InductorChoices):
         row once, combining as it goes, where a row written as one block
         computes the mean before the variance (and the max before the sum of
         exps), so a loop over the row reads it twice. So does the first kernel
-        of a split reduction, whose chunks of the row run past its end: its
-        loads are masked and flat, so no full row of an operand names the row's
-        dim, and a row named by a factory's dim cannot be rolled
+        of a split reduction, whose chunks can run past the row's end (where
+        no count near Inductor's divides it, reduction_split_factor()): its
+        loads are then masked and flat, so no full row of an operand names the
+        row's dim, and a row named by a factory's dim cannot be rolled
         (HelionKernel.row_dim()): the chunk of 2047 strided rows of a column
         sum over [1152000, 512] would be read as one block. So does a row
         past MAX_PERSISTENT_ROW. Other devices and backends keep
@@ -267,6 +269,47 @@ class HelionChoices(InductorChoices):
                 memory_score=MixOrderReduction.get_fusion_score(node1, node2),
             )
         return score
+
+    def reduction_split_factor(
+        self,
+        device: torch.device,
+        reduction_numel_hint: int,
+        numel_hint: int,
+        inner_reduction: bool,
+    ) -> int:
+        """Inductor's number of chunks for a split reduction, moved to the
+        nearest number, within a factor of 2, that divides the row: the first
+        kernel then reads whole chunks, with no mask past the end of the row.
+        var_mean over N, H and W of a channels-last [128, 144, 56, 56], a row
+        of 401408, in Inductor's 591 chunks of 680 (472 past the end):
+
+            for tile_y, tile_x in hl.tile([591, 144]):
+                for tile_r in hl.tile(680):
+                    tmp3 = hl.load(in0, [tile_x.index.reshape([tile_x, 1])
+                        + 144*(((tile_r.index + 680*tile_y.index.reshape(
+                        [tile_y, 1, 1])) % 401408))], extra_mask=tmp2...)
+
+        and in 512 chunks of 784, a tile of a view of in0 with no mask:
+
+            for tile_y, tile_x in hl.tile([512, 144]):
+                for tile_r in hl.tile(784):
+                    tmp0 = in0[tile_y, tile_r, tile_x]"""
+        split = super().reduction_split_factor(
+            device, reduction_numel_hint, numel_hint, inner_reduction
+        )
+        if (
+            device.type != "cuda"
+            or inductor_config.cuda_backend != "helion"
+            or split <= 1
+            or reduction_numel_hint % split == 0
+        ):
+            return split
+        divisors = [
+            d
+            for d in sympy.divisors(reduction_numel_hint)
+            if max(2, split // 2) <= d <= 2 * split
+        ]
+        return min(divisors, key=lambda d: abs(d - split), default=split)
 
     def uuid(self) -> None:
         # The FX graph cache key already holds what use_native_matmul() reads:
