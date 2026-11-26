@@ -188,6 +188,31 @@ def test_the_gate_judges_complex_outputs_by_their_parts(
     assert right["pass"] and right["per_output"][0]["ref_dtype"] == "complex128"
     wrong = gate.check(lambda inputs: torch.complex(inputs[0], 2 * inputs[0]))
     assert not wrong["pass"]
+    # A conjugate view, which torch.view_as_real refuses unresolved: the
+    # conjugate of x + 2xi is the right x - 2xi.
+    conj = gate.check(lambda inputs: torch.complex(inputs[0], 2 * inputs[0]).conj())
+    assert conj["pass"]
+
+
+def test_a_random_complex_output_is_judged_by_its_parts() -> None:
+    # A complex output that depends on random numbers (the complex64 copy of
+    # a dropout's float output) is gated against Inductor's like a float one,
+    # by its real and imaginary parts: a unit in the last place passes, a
+    # wrong element fails. Matched exactly, it failed stock Inductor's own run.
+    torch.manual_seed(0)
+    baseline = torch.randn(16, 8, dtype=torch.complex64)
+    candidate = baseline.clone()
+    torch.view_as_real(candidate).view(torch.int32)[3, 2, 1] += 1
+    fields, passed = common._stochastic_leaf(candidate, baseline)
+    assert passed and "mismatches" not in fields
+    wrong = baseline.clone()
+    wrong[5, 1] += 1
+    _, passed = common._stochastic_leaf(wrong, baseline)
+    assert not passed
+    # A conjugate view (x.conj()), which torch.view_as_real refuses
+    # unresolved, is judged by its parts too.
+    _, passed = common._stochastic_leaf(baseline.conj(), baseline.conj())
+    assert passed
 
 
 @pytest.mark.parametrize("shape", [(), (7,), (5, 3), (2, 9), (3, 0), (2, 3, 4)])
@@ -232,7 +257,8 @@ def test_numerics_checks_work_slice_by_slice(
     # sum_b2873b4c9052's output has 2**31 elements, and a float64 copy of a
     # whole output would take 16 GiB. Sliced (budgets of 7 and 25 elements
     # split the 24 x 10 outputs within and across rows), the checks give the
-    # same results, and no op allocates a larger tensor.
+    # same results, and no op allocates a larger tensor: a conjugate view of a
+    # complex output too, which they resolve a slice at a time.
     monkeypatch.setattr(common, "flatten_outputs", list)
     torch.manual_seed(0)
     reference = torch.randn(24, 10, dtype=torch.float64)
@@ -247,6 +273,8 @@ def test_numerics_checks_work_slice_by_slice(
     infinite = wrong.where(wrong < 1, torch.inf)
     not_a_number = wrong.where(wrong < 1, torch.nan)
     masks = (candidate > 0, baseline > 0.25)
+    pair = torch.randn(24, 10, dtype=torch.complex64).conj()
+    resolved = pair.resolve_conj()
 
     def checks() -> list[object]:
         results: list[object] = [
@@ -258,6 +286,9 @@ def test_numerics_checks_work_slice_by_slice(
             common.output_errors(
                 [wrong, not_a_number, masks[0]], [reference] * 2 + [masks[1]]
             ),
+            common._anchored_leaf(pair, resolved, resolved),
+            common._stochastic_leaf(pair, resolved),
+            common.output_errors([pair], [resolved]),
         ]
         for actual, expected in ((wrong, candidate), masks):
             with pytest.raises(AssertionError) as error:
@@ -270,6 +301,7 @@ def test_numerics_checks_work_slice_by_slice(
         return results
 
     whole = checks()
+    assert whole[6][1] and whole[7][1] and whole[8][0]["max_abs"] == 0.0
     monkeypatch.setattr(common, "CHECK_SLICE_ELEMENTS", budget)
     with LargestTensor() as mode:
         sliced = checks()
@@ -864,7 +896,8 @@ def test_the_errors_recorded_against_eager_see_every_difference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The recorded errors see infinite expected elements and complex outputs'
-    # imaginary parts, and a different output count raises StructureMismatch.
+    # imaginary parts (of a conjugate view too), and a different output count
+    # raises StructureMismatch.
     monkeypatch.setattr(common, "flatten_outputs", list)
     inf = float("inf")
     expected = [torch.tensor([1.0, inf, -inf]), torch.tensor([1 + 1j, 2 - 1j])]
@@ -880,6 +913,9 @@ def test_the_errors_recorded_against_eager_see_every_difference(
         [expected[0], torch.tensor([1 + 1j, 2 + 1j])], expected
     )
     assert row["max_abs"] == 2.0 and row["max_rel"] == 1.0
+    conj = torch.tensor([1 - 1j, 2 + 1j]).conj()
+    (_, row) = common.output_errors([expected[0], conj], expected)
+    assert row["max_abs"] == 0.0
     with pytest.raises(common.StructureMismatch, match="1 outputs, expected 2"):
         common.output_errors([expected[0]], expected)
 
@@ -1494,8 +1530,9 @@ def test_checks_take_outputs_slice_by_slice_and_through_any_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The fill is read in the elements' own bytes: a transposed bool output
-    # (a copy would make its bytes 0 or 1), a complex one, one without
-    # elements and a scalar, within the slice budget.
+    # (a copy would make its bytes 0 or 1), a complex one and its conjugate
+    # view (whose stored bytes are the same), one without elements and a
+    # scalar, within the slice budget.
     monkeypatch.setattr(common, "CHECK_SLICE_ELEMENTS", 5)
     mask = torch.zeros(4, 6, dtype=torch.bool)
     mask.view(torch.uint8)[1, 2:5] = 0xFF
@@ -1507,9 +1544,9 @@ def test_checks_take_outputs_slice_by_slice_and_through_any_layout(
     with LargestTensor() as mode:
         counts = [
             common._poison_left(tensor, 0xFF)
-            for tensor in (mask.t(), scalar, both, torch.zeros(0, 3))
+            for tensor in (mask.t(), scalar, both, both.conj(), torch.zeros(0, 3))
         ]
-    assert counts == [3, 1, 1, 0] and mode.largest <= 5
+    assert counts == [3, 1, 1, 1, 0] and mode.largest <= 5
     zeros = torch.zeros(6, 4, dtype=torch.bool)
     assert common._poison_left(mask.t(), 0xFF, (zeros, 0x00)) == 3
 

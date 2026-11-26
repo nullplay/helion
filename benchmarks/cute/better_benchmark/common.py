@@ -1850,6 +1850,11 @@ def _holds_byte(part: Any, byte: int) -> Any:
     return part.view(integer) == pattern
 
 
+def _stored(tensor: Any) -> Any:
+    """``tensor`` without a conjugate bit, over the same memory."""
+    return tensor.conj() if tensor.is_conj() else tensor
+
+
 def _poison_left(tensor: Any, byte: int, also: tuple[Any, int] | None = None) -> int:
     """How many elements of ``tensor`` consist of the byte ``byte`` alone (a
     complex element: both of its parts); with ``also`` (another tensor of
@@ -1861,8 +1866,11 @@ def _poison_left(tensor: Any, byte: int, also: tuple[Any, int] | None = None) ->
     pairs = tensor.is_complex()
     other, other_byte = (None, 0) if also is None else also
     if pairs:
-        tensor = torch.view_as_real(tensor)
-        other = None if other is None else torch.view_as_real(other)
+        # The stored parts: of a conjugate view (x.conj()), which view_as_real
+        # refuses, its conj(), the same memory without the conjugate bit
+        # (resolve_conj() would negate the imaginary parts, sign bits and all).
+        tensor = torch.view_as_real(_stored(tensor))
+        other = None if other is None else torch.view_as_real(_stored(other))
     count = 0
     for part in _slices(tensor.shape):
         found = _holds_byte(tensor[part], byte)
@@ -1931,22 +1939,44 @@ def check_written(outputs: Any, rerun: Callable[[int], Any]) -> None:
 CHECK_SLICE_ELEMENTS = 1 << 24
 
 
-def _slices(shape: Sequence[int]) -> Iterator[tuple[int | slice, ...]]:
+def _slices(
+    shape: Sequence[int], limit: int | None = None
+) -> Iterator[tuple[int | slice, ...]]:
     """Indices that split a tensor of ``shape`` into views of at most
-    ``CHECK_SLICE_ELEMENTS`` elements, in row-major order: runs of whole rows
-    of the first dim, and a row longer than that split along its own dims."""
+    ``limit`` (by default ``CHECK_SLICE_ELEMENTS``) elements, in row-major
+    order: runs of whole rows of the first dim, and a row longer than that
+    split along its own dims."""
+    limit = CHECK_SLICE_ELEMENTS if limit is None else limit
     if not shape:
         yield ()
         return
     row = math.prod(shape[1:])
-    if row <= CHECK_SLICE_ELEMENTS:
-        step = max(CHECK_SLICE_ELEMENTS // max(row, 1), 1)
+    if row <= limit:
+        step = max(limit // max(row, 1), 1)
         for start in range(0, shape[0], step):
             yield (slice(start, start + step),)
         return
     for index in range(shape[0]):
-        for rest in _slices(shape[1:]):
+        for rest in _slices(shape[1:], limit):
             yield (index, *rest)
+
+
+def _pair_slices(shape: Sequence[int], pairs: bool) -> list[tuple[int | slice, ...]]:
+    """:func:`_slices` of ``shape``; with ``pairs`` (complex tensors, compared
+    by their real and imaginary parts through :func:`_piece`), of half the
+    elements, so that the parts stay within ``CHECK_SLICE_ELEMENTS``."""
+    return list(_slices(shape, CHECK_SLICE_ELEMENTS // 2 if pairs else None))
+
+
+def _piece(tensor: Any, part: tuple[int | slice, ...], pairs: bool) -> Any:
+    """``tensor[part]``; with ``pairs``, its real and imaginary parts
+    (``torch.view_as_real``). A conjugate view (x.conj()), which
+    view_as_real refuses, is resolved here, a slice at a time: resolving
+    the whole output would copy all of it."""
+    import torch
+
+    piece = tensor[part]
+    return torch.view_as_real(piece.resolve_conj()) if pairs else piece
 
 
 def _nan_max(a: float, b: float) -> float:
@@ -1999,7 +2029,6 @@ def output_errors(actual: Any, expected: Any) -> list[dict[str, Any]]:
     computed slice by slice (``CHECK_SLICE_ELEMENTS``); a complex output's
     over its real and imaginary parts.  Raises :class:`StructureMismatch`
     when the output counts differ, as :func:`check_outputs` does."""
-    import torch
 
     a_list = flatten_outputs(actual)
     e_list = flatten_outputs(expected)
@@ -2017,15 +2046,15 @@ def output_errors(actual: Any, expected: Any) -> list[dict[str, Any]]:
             "stride_match": shape_match and not _stride_mismatches(a, e),
         }
         if shape_match and e.numel():
-            if e.is_complex() and a.is_complex():
-                # A float64 copy of a complex tensor drops its imaginary part.
-                a, e = torch.view_as_real(a), torch.view_as_real(e)
+            # A float64 copy of a complex tensor drops its imaginary part: two
+            # complex outputs compare by their real and imaginary parts.
+            pairs = e.is_complex() and a.is_complex()
             if e.is_floating_point() or e.is_complex():
                 max_abs = absmax = 0.0
                 any_finite = nan_mismatch = inf_mismatch = False
-                for part in _slices(e.shape):
+                for part in _pair_slices(e.shape, pairs):
                     part_abs, part_absmax, part_finite, part_nan, part_inf = (
-                        _slice_errors(a[part], e[part])
+                        _slice_errors(_piece(a, part, pairs), _piece(e, part, pairs))
                     )
                     if part_finite:
                         any_finite = True
@@ -2312,14 +2341,16 @@ def _anchored_leaf(
     (none does).
 
     The outputs are compared slice by slice (``CHECK_SLICE_ELEMENTS``), in
-    two passes: the threshold needs the whole output's baseline error."""
-    parts = list(_slices(reference.shape))
+    two passes: the threshold needs the whole output's baseline error. A
+    complex output is compared by its real and imaginary parts."""
+    pairs = reference.is_complex()
+    parts = _pair_slices(reference.shape, pairs)
     baseline_nonfinite = 0
     nan_differs = False
     err_base = absmax = 0.0
     for part in parts:
         part_nonfinite, part_nan, part_err, part_absmax = _leaf_first_pass(
-            candidate[part], baseline[part], reference[part]
+            *(_piece(t, part, pairs) for t in (candidate, baseline, reference))
         )
         baseline_nonfinite += part_nonfinite
         nan_differs = nan_differs or part_nan
@@ -2339,7 +2370,7 @@ def _anchored_leaf(
     passed = True
     for part in parts:
         part_err, part_flips, part_passed = _leaf_second_pass(
-            candidate[part], reference[part], threshold
+            _piece(candidate, part, pairs), _piece(reference, part, pairs), threshold
         )
         err_candidate = max(err_candidate, part_err)
         one_ulp_flips += part_flips
@@ -2359,13 +2390,17 @@ def _stochastic_leaf(candidate: Any, baseline: Any) -> tuple[dict[str, Any], boo
     """One random-number dependent output against Inductor's: a mask (or any
     integer output) must match exactly, a float output must pass the gate
     with Inductor's output as its reference (zero baseline error: within
-    ``1e-5 * max(|ref|max, 1)`` or one unit in the last place). A mask's
-    record also counts the elements only the candidate or only Inductor
-    keeps."""
+    ``1e-5 * max(|ref|max, 1)`` or one unit in the last place), and so must
+    the real and imaginary parts of a complex one, as the gate judges a
+    deterministic complex output (``AnchoredGate.check``): an exact match
+    failed the complex64 copy of a dropout's float output whose float form
+    passed, for stock Inductor's own run as well. A mask's record also
+    counts the elements only the candidate or only Inductor keeps."""
     import torch
 
     fields: dict[str, Any]
-    if candidate.is_floating_point():
+    pairs = candidate.is_complex() and baseline.is_complex()
+    if candidate.is_floating_point() or pairs:
         fields, passed = _anchored_leaf(candidate, baseline, baseline)
     else:
         mismatches = _count_mismatches(candidate, baseline)
@@ -2558,9 +2593,6 @@ class AnchoredGate:
                 record["skip"] = "non_float"
             else:
                 record["ref_dtype"] = str(ref.dtype).replace("torch.", "")
-                if ref.is_complex():
-                    # The real and imaginary parts, as float outputs.
-                    cand, base, ref = map(torch.view_as_real, (cand, base, ref))
                 fields, passed = _anchored_leaf(cand, base, ref)
                 record.update(fields)
                 result["pass"] = result["pass"] and passed
