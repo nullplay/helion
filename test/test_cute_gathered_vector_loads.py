@@ -8,7 +8,9 @@ import pytest
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import import_example
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
@@ -267,3 +269,52 @@ def test_row_mask_keeps_the_packet_zero_for_an_atomic() -> None:
     assert isinstance(pointer, ast.IfExp), ast.unparse(pointer)
     assert "mask_0" in ast.unparse(pointer.test)
     assert "else cutlass.Float32(0)" in ast.unparse(vloop)
+
+
+def _embedding_rows_and_sums(
+    ids: torch.Tensor, table: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty(
+        [ids.size(0), table.size(1)], dtype=table.dtype, device=table.device
+    )
+    sums = torch.empty([ids.size(0)], dtype=torch.float32, device=table.device)
+    for tile_b in hl.tile(ids.size(0)):
+        rows = table[ids[tile_b], :]
+        out[tile_b, :] = rows
+        sums[tile_b] = rows.to(torch.float32).sum(-1)
+    return out, sums
+
+
+@skipUnlessBackends(["cute"])
+def test_gathered_rows_stored_beside_their_sum_store_a_lane_each() -> None:
+    # The rows a lookup gathers, stored whole beside a sum over them (GPT-2's
+    # embeddings returned beside the LayerNorm of their sum): the sum's
+    # threads hold the row, and each stores its own elements. Copying the
+    # whole row in every lane repeated the copy once per element.
+    kernel = helion.kernel(
+        _embedding_rows_and_sums,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    ids = torch.randint(0, 100, (35,), dtype=torch.int64)
+    table = torch.randn(100, 256, dtype=torch.bfloat16)
+    code = _generate(kernel, (ids, table), block_sizes=[2])
+    assert "slice_idx" not in code, code
+
+
+@pytest.mark.cuda
+@skipUnlessBackends(["cute"])
+@skipIfNotCUDA()
+def test_cuda_gathered_rows_stored_beside_their_sum_match_eager() -> None:
+    kernel = helion.kernel(
+        _embedding_rows_and_sums,
+        backend="cute",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[2]),
+    )
+    ids = torch.randint(0, 100, (35,), dtype=torch.int64, device=DEVICE)
+    table = torch.randn(100, 256, dtype=torch.bfloat16, device=DEVICE)
+    out, sums = kernel(ids, table)
+    torch.testing.assert_close(out, table[ids])
+    torch.testing.assert_close(sums, table[ids].float().sum(-1), rtol=1e-4, atol=1e-3)

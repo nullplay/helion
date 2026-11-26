@@ -2408,6 +2408,22 @@ def _codegen_cute_store_loaded_index_trailing_slices(
     trailing_store = subscript[indexer_value.ndim :]
     if not all(idx == slice(None) for idx in trailing_store):
         return None
+    env = CompileEnvironment.current()
+    # A trailing slice whose block a lane strategy holds (any full slice's
+    # block that a reduction or a device loop tiles, whether or not a
+    # reduction reads it) is stored a lane at a time by the regular store,
+    # each lane its own elements: a gathered embedding row stored back inside
+    # the LayerNorm that reads it, out1[tile_y, tile_x, :] = in2[tmp6, :],
+    # copied its whole 768-element row in every lane, 768 times the row per
+    # element (GPT-2's embedding + dropout + LayerNorm took 1.46 ms instead
+    # of tens of microseconds). The slice copy below is left for slices no
+    # lane strategy holds.
+    for dim in range(indexer_value.ndim, tensor.ndim):
+        if any(
+            _cute_lane_strategy(state, block_id) is not None
+            for block_id in _matching_block_ids(env, tensor.shape[dim])
+        ):
+            return None
 
     ast_source_subscript = list(
         map_arg(source_subscript_args, lambda arg: state.env[arg])
@@ -2435,7 +2451,6 @@ def _codegen_cute_store_loaded_index_trailing_slices(
     if len(target_prefix) != indexer_value.ndim:
         return None
 
-    env = CompileEnvironment.current()
     index_dtype = env.backend.dtype_str(env.index_dtype)
     source_loop_vars = [
         state.device_function.new_var("slice_idx", dce=True) for _ in trailing_source
