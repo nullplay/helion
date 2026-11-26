@@ -35,6 +35,7 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import FloorDiv
 from torch.utils._sympy.functions import Identity
+from torch.utils._sympy.functions import ModularIndexing
 from torch.utils._sympy.value_ranges import ValueRanges
 from torch.utils._sympy.value_ranges import bound_sympy
 
@@ -68,9 +69,11 @@ if TYPE_CHECKING:
 # A tile name per dim, or 1 for a broadcast dim.
 TileShape = tuple[str | int, ...]
 # q_ is no range tree of Inductor's: the runs of an rdim a kernel reads in
-# one tile of its outer loop (HelionKernel.rdim_runs()).
+# one tile of its outer loop (HelionKernel.rdim_runs()). Nor is w_: the outer
+# tile of a pointwise axis the kernel tiles as two (HelionKernel.split_axis()).
 TILE_NAMES = {
     "z0_": "tile_z",
+    "w_": "tile_w",
     "y": "tile_y",
     "x": "tile_x",
     "q_": "tile_q",
@@ -79,6 +82,8 @@ TILE_NAMES = {
 TILE_AXES = {name: axis for axis, name in TILE_NAMES.items()}
 # The index of tile_q, the run (HelionKernel.rdim_runs()).
 RUN_INDEX = sympy.Symbol("q0", integer=True, nonnegative=True)
+# The index of tile_w, the outer tile of a split axis (HelionKernel.split_axis()).
+SPLIT_INDEX = sympy.Symbol("w0", integer=True, nonnegative=True)
 ARG_REDUCTIONS = OrderedSet(["argmax", "argmin"])
 # The torch function that reduces a block for each plain reduction type.
 REDUCTION_FUNCTIONS = {
@@ -533,6 +538,11 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         # kernel emits its whole body over, and the segment's start while it
         # does; see pointwise_segments() and pointwise_segment().
         self.axis_cuts: dict[str, OrderedSet[int]] = {}
+        # The sizes by which an index that no view reads divides each axis or
+        # takes it modulo them (note_axis_divisors()), and the axis tiled as
+        # two tiles, with the inner tile's extent (split_axis()).
+        self.axis_divisors: dict[str, OrderedSet[int]] = {}
+        self.split: tuple[str, int] | None = None
         self.axis_segments: tuple[str, list[tuple[int, int]]] | None = None
         self.axis_segment: tuple[str, int] | None = None
 
@@ -564,6 +574,111 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             "r0_": self.numels["r0_"],
         }
         self.tile_ranges = {self.symbols[a]: self.extents[a] for a in self.axes}
+
+    def note_axis_divisors(self, index: sympy.Expr) -> None:
+        """Keep the sizes by which `index`, over the tile indices, divides an
+        axis or takes it modulo them (axis_split()): 256 for y of the store of
+        MobileViT's unfold, which reads y as 36*(y // 256) + 432*(y % 256).
+        subscript() notes each index that it reads as spans or flat, which
+        a probe emitted before its segments may read either way. A view's
+        subscript notes none: repeat_kv's [Hk, S, D] view read at z // 2
+        (quotient_subscript()) already is one. Only a tile index itself counts
+        as divided: a sum's, as Swin's roll reads (3 + y + 7*(z % 8)) % 56,
+        is not noted, and its index stays flat whatever the split."""
+        axis_of = {symbol: axis for axis, symbol in self.symbols.items()}
+        for term in index.atoms(FloorDiv, ModularIndexing, sympy.Mod):
+            base, *args = term.args
+            sizes = [int(arg) for arg in args if isinstance(arg, sympy.Integer)]
+            if base not in axis_of or len(sizes) < len(args):
+                continue
+            if isinstance(term, ModularIndexing):
+                divisor, modulus = sizes
+                sizes = [divisor, divisor * modulus] if divisor != 1 else [modulus]
+            self.axis_divisors.setdefault(axis_of[base], OrderedSet()).update(sizes)
+
+    def axis_split(self) -> tuple[str, int] | None:
+        """The pointwise axis that the kernel's indices no view reads divide,
+        or take modulo, by one size K below its extent that divides it
+        (note_axis_divisors()), and K: split_axis() tiles it as extent / K by
+        K, over which every such index is affine (a division of a sum of tile
+        indices, which note_axis_divisors() does not note, stays flat). None
+        where those indices divide another axis too, or one axis by several
+        sizes, or the innermost axis, since the split would leave them flat;
+        the rdim, the runs and an axis that a comparison of an index with an
+        integer cuts (note_axis_cut()) do not count: segments make such an
+        axis affine where they form (pointwise_segments()), and where they
+        do not, its masked accesses keep it as it was.
+
+        The innermost axis stays whole: split, its tile would hold runs of K
+        elements, where its accesses read whole runs of the axis. In the
+        band kernels of a Longformer training graph (better-benchmark's
+        sum_444779f98932_47e7063f), the x of 262656 = 512 * 513 that loads
+        divide by 513 would hold runs of 513 elements, odd and misaligned for
+        16-byte packets: two of its kernels took 146 and 184 us where they had
+        taken 114 and 111 (GB300, each after a full search)."""
+        divided: dict[str, list[int]] = {}
+        for axis, divisors in self.axis_divisors.items():
+            if axis in ("r0_", "q_") or axis in self.axis_cuts:
+                continue
+            extent = self.extents.get(axis)
+            if not isinstance(extent, (int, sympy.Integer)):
+                return None
+            # A size of the whole extent divides nothing: y // E is 0 and
+            # y % E is y.
+            sizes = [size for size in divisors if size < int(extent)]
+            if sizes:
+                divided[axis] = sizes
+        if len(divided) != 1:
+            return None
+        ((axis, sizes),) = divided.items()
+        innermost = self.outer_axes[-1]
+        if (
+            axis == innermost
+            or len(sizes) != 1
+            or sizes[0] <= 1
+            or int(self.extents[axis]) % sizes[0]
+        ):
+            return None
+        return axis, sizes[0]
+
+    def split_axis(self, axis: str, inner: int) -> None:
+        """Tile pointwise `axis` as two tiles, tile_w over extent / inner and its
+        own over inner (axis_split()), with index a inner * tile_w + a
+        (tile_index()). Natural_tiling() tiles at most three pointwise dims,
+        Inductor's range trees, so it joins the fourth of MobileViT's unfold, a
+        cat of three trimmed [512, 4, 256, 40] parts copied to [512, 256, 3, 4,
+        36], into y = 256 * k + q, which the store divides back:
+
+            for tile_z, tile_y, tile_x in hl.tile([512, 1024, 36]):
+                tmp8 = in0[tile_z, tile_y, tile_x].to(torch.float32)
+                ...
+                out0[tile_x.index + 36*(tile_y.index.reshape([tile_y, 1]) // 256)
+                    + 432*((tile_y.index.reshape([tile_y, 1]) % 256))
+                    + 110592*tile_z.index.reshape([tile_z, 1, 1])] = ...
+
+        with two more stores, of the other parts, at 144 and 288. The CuTe
+        backend cannot prove the three apart across the lanes of a thread and
+        refuses 93% of the configs (56 of 60 random ones). Split, every load
+        and store is a view:
+
+            for tile_z, tile_w, tile_y, tile_x in hl.tile([512, 4, 256, 36]):
+                tmp8 = in0[tile_z, tile_w, tile_y, tile_x].to(torch.float32)
+                ...
+                out0[tile_z, tile_w, tile_y, tile_x] = tmp8.to(torch.bfloat16)
+
+        and the kernel takes 43 us where it took 68 (cold, each after a quick
+        search, on a GB300)."""
+        outer = int(self.extents[axis]) // inner
+        position = self.axes.index(axis)
+        self.axes = (*self.axes[:position], "w_", *self.axes[position:])
+        self.outer_axes = tuple(name for name in self.axes if name != "r0_")
+        self.symbols["w_"] = SPLIT_INDEX
+        self.extents["w_"] = sympy.Integer(outer)
+        self.extents[axis] = sympy.Integer(inner)
+        self.tile_ranges = {
+            self.symbols[name]: self.extents[name] for name in self.axes
+        }
+        self.split = (axis, inner)
 
     def partial_accumulate(
         self,
@@ -903,6 +1018,12 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             r = self.symbols["r0_"]
             run = sympy.Mul(sympy.Integer(self.runs[1]), RUN_INDEX)
             index = sympy.expand(index.xreplace({r: sympy.Add(run, r)}))
+        if self.split is not None:
+            # A split axis (split_axis()): index a is inner * tile_w + a.
+            axis, inner = self.split
+            symbol = self.symbols[axis]
+            outer = sympy.Mul(sympy.Integer(inner), SPLIT_INDEX)
+            index = sympy.expand(index.xreplace({symbol: sympy.Add(outer, symbol)}))
         if "y" in self.symbols and self.mix_order_reduction:
             # Split x (split_x()): index x is tile_x of split tile_y.
             x = self.symbols["x"]
@@ -1085,6 +1206,9 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             return gather
         if not output and (quotient := self.quotient_subscript(buffer, index, axes)):
             return quotient
+        # No view reads the index: it may divide an axis that tiled as two
+        # tiles would read through one (axis_split()).
+        self.note_axis_divisors(index)
         if spans and (span := self.span_subscript(buffer, index, axes, output)):
             return span
         return self.flat_subscript(buffer, index, axes, output=output)
@@ -1416,6 +1540,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         output: bool = False,
     ) -> tuple[HelionTensorArg, list[str], TileShape]:
         """A flat view of the storage read at `index`, like a Triton pointer offset."""
+        self.note_axis_divisors(index)
         size = buffer.get_layout().storage_size()
         operand = self.view(buffer, [size], [sympy.S.One], sympy.S.Zero)
         arg = self.tensor_arg(operand, output=output)
