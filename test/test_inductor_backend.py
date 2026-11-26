@@ -784,6 +784,54 @@ def check_channel_cat_segments(test: InductorBackendTestCase, backend: str) -> N
     test.assertNotIn("hl.tile([1024, 1])", source)
 
 
+def check_cat_spans(test: InductorBackendTestCase, backend: str) -> None:
+    """ViT's LayerNorm of cat([cls, patches], 1): a persistent rdim of 96
+    over x, cut at 1 of 65. The patches are a bf16 view of a channels-last
+    image, which the one loop over the cat reads as spans of 96
+    (HelionKernel.span_subscript()): in1[span, :] with the span computed
+    from tile_y and tile_x, where the flat index read one element a lane."""
+    cls = torch.randn(1, 1, 96, device=DEVICE, dtype=torch.bfloat16)
+    image = torch.randn(4, 96, 8, 8, device=DEVICE, dtype=torch.bfloat16)
+    image = image.to(memory_format=torch.channels_last)
+    w, b = torch.randn(96, device=DEVICE), torch.randn(96, device=DEVICE)
+
+    def vit(cls, image, w, b):
+        patches = image.flatten(2).transpose(1, 2)
+        x = torch.cat([cls.expand(4, 1, 96), patches], 1)
+        return x, torch.nn.functional.layer_norm(x.float(), [96], w, b)
+
+    (source,) = test.compile(vit, cls, image, w, b, tol=1e-2, backend=backend)
+    test.assertIn("for tile_y, tile_x in hl.tile([4, 65]):", source)
+    test.assertRegex(
+        source, r"hl\.load\(in\d, \[\(-1\) \+ tile_x\.index .*, slice\(None\)\]"
+    )
+
+
+def check_window_spans(test: InductorBackendTestCase, backend: str) -> None:
+    """Swin's residual LayerNorm, roll by 3 and window partition over a [2, 14,
+    14, 128] bf16 image: the window kernel reads the rolled tokens, whose
+    flat index is 128 times a token of // and % of the tiles plus x, as spans
+    of 128 (HelionKernel.span_subscript()), and writes each window's tokens as
+    spans too: out0[span, tile_x] = ..."""
+    x = torch.randn(2 * 14 * 14, 128, device=DEVICE, dtype=torch.bfloat16)
+    shortcut = torch.randn(2, 14 * 14, 128, device=DEVICE, dtype=torch.bfloat16)
+    w = torch.randn(128, device=DEVICE, dtype=torch.bfloat16)
+    b = torch.randn(128, device=DEVICE, dtype=torch.bfloat16)
+
+    def swin(x, shortcut, w, b):
+        v = (shortcut + x.view(2, 196, 128)).view(2, 14, 14, 128)
+        y = torch.nn.functional.layer_norm(v.float(), [128], w.float(), b.float())
+        idx = torch.fmod(torch.arange(14, device=x.device) + 3, 14)
+        y = y.to(torch.bfloat16)[:, idx][:, :, idx]
+        y = y.view(2, 2, 7, 2, 7, 128).permute(0, 1, 3, 2, 4, 5).contiguous()
+        return v, y.view(-1, 49, 128)
+
+    sources = test.compile(swin, x, shortcut, w, b, tol=2e-2, backend=backend)
+    window = "\n".join(sources)
+    test.assertRegex(window, r"out\d\[[^\n]*%[^\n]*, tile_x\] = ")
+    test.assertRegex(window, r"tmp\d+ = in\d\[[^\n]*%[^\n]*, tile_x\]")
+
+
 # The CuTe lane, where CuTe DSL is installed, runs this.
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
@@ -1182,6 +1230,12 @@ class TestInductorCute(InductorBackendTestCase):
 
     def test_channel_cat_segments(self):
         check_channel_cat_segments(self, "cute")
+
+    def test_cat_spans(self):
+        check_cat_spans(self, "cute")
+
+    def test_window_spans(self):
+        check_window_spans(self, "cute")
 
     @looped
     def test_welford(self):
@@ -3509,6 +3563,12 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
 
     def test_channel_cat_segments(self):
         check_channel_cat_segments(self, "triton")
+
+    def test_cat_spans(self):
+        check_cat_spans(self, "triton")
+
+    def test_window_spans(self):
+        check_window_spans(self, "triton")
 
     def test_long_rdims_join_dims_split_by_r_invariant_reads(self):
         # An rdim of 2048 over (y, x) = [4, 16], with an r-invariant value of

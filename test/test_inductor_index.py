@@ -255,6 +255,230 @@ class TestFlatLane(TestCase):
                     self.assertEqual(coordinates, [expected], dtype)
 
 
+class TestSpanSubscript(TestCase):
+    """HelionKernel.span_subscript(): a flat index that adds the innermost
+    tile, with coefficient 1, to a multiple of its extent the other tiles
+    select reads a view of spans of that extent."""
+
+    def span(
+        self, sizes, index, numel, dtype=torch.bfloat16, persistent=None, axes=None
+    ):
+        axes = list(sizes) if axes is None else axes
+        graph = GraphLowering(torch.fx.symbolic_trace(lambda x: x + 1))
+        with V.set_graph_handler(graph):
+            total = 1
+            for size in sizes.values():
+                total *= size
+            reduction = sizes.get("r0_")
+            kernel = HelionKernel(
+                sizes,
+                features=SIMDKernelFeatures(
+                    [],
+                    sympy.Integer(total // (reduction or 1)),
+                    sympy.Integer(reduction or 1),
+                ),
+                **(
+                    {}
+                    if persistent is None
+                    else {"override_persistent_reduction": persistent}
+                ),
+            )
+            buffer = InputBuffer(
+                name="arg0_1",
+                layout=FixedLayout(torch.device("cuda"), dtype, [numel], [1]),
+            )
+            with V.set_kernel_handler(kernel):
+                found = kernel.span_subscript(buffer, index(**kernel.symbols), axes)
+                # A store's subscript, and one with spans off, as store() asks
+                # within a kernel emitted over segments.
+                stores = [
+                    kernel.subscript(
+                        buffer,
+                        index(**kernel.symbols),
+                        axes,
+                        output=True,
+                        spans=spans,
+                    )[1]
+                    for spans in (True, False)
+                ]
+        if found is None:
+            return None, stores
+        arg, coordinates, shape = found
+        layout = arg.operand.get_layout()
+        layout_facts = (list(layout.size), list(layout.stride), layout.offset)
+        return (*layout_facts, coordinates, shape), stores
+
+    def test_swin_window_partition(self):
+        # Swin's window partition after a roll of 3 over [28672, 7, 128]
+        # tiles: x plus 128 times the rolled, windowed token, of a [64, 56,
+        # 56, 128] input, reads the [200704, 128] view by the token's span.
+        token = lambda z, y: (  # noqa: E731
+            ModularIndexing(3 + y + 7 * ModularIndexing(z, 1, 8), 1, 56)
+            + 56
+            * ModularIndexing(
+                3 + 7 * ModularIndexing(z, 56, 8) + ModularIndexing(z, 8, 7), 1, 56
+            )
+            + 3136 * FloorDiv(z, 448)
+        )
+        found, stored = self.span(
+            {"z0_": 28672, "y": 7, "x": 128},
+            lambda z0_, y, x: x + 128 * token(z0_, y),
+            25690112,
+        )
+        assert found is not None
+        sizes, strides, offset, coordinates, shape = found
+        self.assertEqual((sizes, strides, offset), ([200704, 128], [128, 1], 0))
+        self.assertEqual(coordinates[1], "tile_x")
+        self.assertNotIn("tile_x", coordinates[0])
+        self.assertIn("tile_z.index.reshape([tile_z, 1])", coordinates[0])
+        self.assertEqual(shape, ("tile_z", "tile_y", "tile_x"))
+        # Its store writes the span view too, but within a kernel emitted over
+        # segments (store() turns spans off) through the flat index: the CuTe
+        # backend cannot tell the segments' spans of one output apart.
+        span_store, flat_store = stored
+        self.assertEqual(len(span_store), 2)
+        self.assertEqual(span_store[1], "tile_x")
+        self.assertEqual(len(flat_store), 1)
+        self.assertTrue(flat_store[0].endswith(" + tile_x.index"))
+
+    def test_persistent_rdim_and_offset(self):
+        # A persistent rdim is the innermost tile: a cat's second part, read
+        # from 128 elements before x's span (an offset of -128 = -1 span),
+        # and a part starting 32 elements into a span (an offset that is no
+        # multiple of the extent) keeps a view starting there.
+        found, _ = self.span(
+            {"x": 1000, "r0_": 128},
+            lambda x, r0_: r0_ - 128 + 128 * ModularIndexing(x, 1, 500),
+            128000,
+            persistent=True,
+        )
+        assert found is not None
+        sizes, strides, offset, coordinates, shape = found
+        self.assertEqual((sizes, strides, offset), ([1000, 128], [128, 1], 0))
+        self.assertEqual(coordinates[1], ":")
+        self.assertEqual(shape, ("tile_x", "tile_r"))
+        found, _ = self.span(
+            {"x": 999, "r0_": 128},
+            lambda x, r0_: r0_ + 32 + 128 * ModularIndexing(x, 1, 500),
+            128000,
+            persistent=True,
+        )
+        assert found is not None
+        self.assertEqual(found[:3], ([999, 128], [128, 1], 32))
+
+    def test_declines(self):
+        # An offset no multiple of the extent, a scaled innermost tile, a
+        # looped rdim (the backend reads its flat index as a lane of the
+        # loop's tile, match_flat_gather_lane()) and a span outside the view's
+        # whole spans keep the flat index.
+        cases = [
+            (
+                {"y": 7, "x": 128},
+                lambda y, x: x + 100 * ModularIndexing(y, 1, 5),
+                1024,
+                None,
+            ),
+            (
+                {"y": 7, "x": 64},
+                lambda y, x: 2 * x + 128 * ModularIndexing(y, 1, 5),
+                1024,
+                None,
+            ),
+            (
+                {"x": 64, "r0_": 4096},
+                lambda x, r0_: r0_ + 4096 * ModularIndexing(x, 1, 32),
+                262144,
+                False,
+            ),
+            # F.pad(x, (0, 4)) of a [4, 17, 304] tensor's [:, :16, :300]: its
+            # last tokens' span (15 + 17 * 3 = 66) reaches past the 66 whole
+            # spans of 304 its 20364-element storage holds.
+            (
+                {"z0_": 4, "y": 16, "r0_": 304},
+                lambda z0_, y, r0_: r0_ + 304 * (y + 17 * z0_),
+                20364,
+                True,
+            ),
+            # F.pad(x, (96, 0)) of a [2, 128] tensor's [:, :32]: a view from
+            # 32 elements in, whose span y - 1 is -1 for y = 0, where the
+            # left pad's lanes read the storage's first 32 elements.
+            (
+                {"y": 2, "r0_": 128},
+                lambda y, r0_: r0_ - 96 + 128 * y,
+                160,
+                True,
+            ),
+        ]
+        for sizes, index, numel, persistent in cases:
+            found, _ = self.span(sizes, index, numel, persistent=persistent)
+            self.assertIsNone(found, sizes)
+        # So does any access in the loop over tile_r, whose flat index (an
+        # offset plus the lane) the backend's V-loop sink reads in packets:
+        # a load there over tiles of y and x only, x + 128 * (y % 4), which
+        # outside the loop reads the [4, 128] view by span.
+        index = lambda y, x, r0_: x + 128 * ModularIndexing(y, 1, 4)  # noqa: E731
+        sizes = {"y": 8, "x": 128, "r0_": 4096}
+        for persistent in (False, True):
+            found, _ = self.span(
+                sizes, index, 512, persistent=persistent, axes=["y", "x"]
+            )
+            self.assertEqual(found is None, not persistent)
+
+    def test_spans_on_16_byte_boundaries(self):
+        # Spans of 6156 elements: 24624 bytes in fp32, on 16-byte boundaries,
+        # read the view; 12312 bytes in bf16, every other span 8 bytes off
+        # them, and spans of 257 bf16 elements keep the flat index.
+        index = lambda y, x: x + 6156 * ModularIndexing(y, 1, 4)  # noqa: E731
+        found, _ = self.span({"y": 8, "x": 6156}, index, 24624, dtype=torch.float32)
+        assert found is not None
+        self.assertEqual(found[:3], ([4, 6156], [6156, 1], 0))
+        found, _ = self.span({"y": 8, "x": 6156}, index, 24624)
+        self.assertIsNone(found)
+        found, _ = self.span(
+            {"z0_": 512, "x": 257},
+            lambda z0_, x: x + 257 * ModularIndexing(z0_, 1, 256),
+            65792,
+        )
+        self.assertIsNone(found)
+
+    def test_masked_off_load_keeps_the_flat_index(self):
+        # b's load of cat([a, b], 1), a and b bf16 [4, 256, 64], over tiles of
+        # a's 256 y: under its mask y >= 256, which the tiles' ranges prove
+        # false, it reads nothing and keeps its flat index (load()); under a
+        # mask they prove nothing of, it reads b's [1024, 64] view by span.
+        layout = FixedLayout(
+            torch.device("cuda"), torch.bfloat16, [4, 256, 64], [16384, 64, 1]
+        )
+        graph = GraphLowering(torch.fx.symbolic_trace(lambda x: x + 1))
+        graph.name_to_buffer["buf0"] = InputBuffer(name="buf0", layout=layout)
+        masks = [
+            CSEVariable(name, ValueRanges.unknown(), torch.bool, ("tile_y",))
+            for name in ("off", "unknown")
+        ]
+        interpreter = SimpleNamespace(current_node=None)
+        with V.set_graph_handler(graph), V.set_interpreter_handler(interpreter):
+            features = SIMDKernelFeatures([], sympy.Integer(65536), sympy.Integer(1))
+            kernel = HelionKernel({"z0_": 4, "y": 256, "x": 64}, features=features)
+            z, y, x = (kernel.symbols[axis] for axis in ("z0_", "y", "x"))
+            kernel.predicates["off"] = [sympy.Ge(y, 256, evaluate=False)]
+            with V.set_kernel_handler(kernel):
+                for mask in masks:
+                    kernel.load_masks.append(mask)
+                    kernel.load("buf0", x + 64 * (y - 256) + 16384 * z)
+                    kernel.load_masks.pop()
+        off, unknown = kernel.compute.getvalue().splitlines()
+        self.assertIn(
+            "[((-16384) + 64*tile_y.index.reshape([tile_y, 1])"
+            " + 16384*tile_z.index.reshape([tile_z, 1, 1])) + tile_x.index]",
+            off,
+        )
+        self.assertIn("extra_mask=off.reshape([tile_y, 1])", off)
+        self.assertIn(
+            "[(-256) + tile_y.index + 256*tile_z.index.reshape([tile_z, 1]), tile_x]",
+            unknown,
+        )
+
+
 class TestPersistentLoad(TestCase):
     def test_masked_load_through_layout(self):
         # In a persistent reduction a masked load through its buffer's own
