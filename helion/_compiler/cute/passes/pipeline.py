@@ -685,6 +685,7 @@ def _hoist_warp_reduce_from_vloop(s: _DeviceBodyState) -> None:
     # from ~396 to ~99 (4x fewer SHFL trees).  The collapse stage needs
     # the post-rename canonical map to see through loop-carried alias
     # vars (``v_1`` renaming to ``mi``).
+    from ..hoist_warp_reduce import KernelTensors
     from ..hoist_warp_reduce import hoist_warp_reduce_from_vloop
 
     s.kernel_body = hoist_warp_reduce_from_vloop(
@@ -693,6 +694,9 @@ def _hoist_warp_reduce_from_vloop(s: _DeviceBodyState) -> None:
         running_sum_accumulators=s.fn.cute_state.lanes.matmul_running_sums,
         rename_groups=s.ctx.rename_groups,
         unfoldable_vec_lanes=s.fn.cute_state.lanes.unfoldable_vec_lanes,
+        tensors=KernelTensors(
+            s.ctx.tensor_arg_names, frozenset(s.ctx.proven_disjoint_tensor_pairs)
+        ),
     )
 
 
