@@ -504,6 +504,32 @@ class TestLayoutSplit(TestCase):
         self.assertEqual(split_runs(4, 20014, 64), 8)
         self.assertEqual(split_runs(2, 40, 64), 2)
 
+    def test_layout_split_pays(self):
+        # Whether a reduction Inductor would not split takes the layout split
+        # all the same (HelionChoices.layout_split_pays()): from
+        # WIDE_LAYOUT_SPLIT_VALUES values on, and from MIN_LAYOUT_SPLIT_VALUES
+        # over rdims longer than MAX_UNSPLIT_RDIM. BatchNorms over NCHW
+        # tensors: an rdim of N * H * W values per channel.
+        pays = HelionChoices.layout_split_pays
+        with helion_config.patch(backend="cute"):
+            # [8, 64, 64, 64], 2**21 values (test_nchw_reductions), and [32,
+            # 2048, 7, 7], 3.2M values over rdims of 1568: the split.
+            self.assertTrue(pays(8 * 64 * 64, 64))
+            self.assertTrue(pays(32 * 7 * 7, 2048))
+            # 1M-1.6M values over rdims of 12544 and 32768: the split.
+            self.assertTrue(pays(16 * 28 * 28, 96))
+            self.assertTrue(pays(128 * 16 * 16, 32))
+            # 1.6M values over rdims of 1568 and 6144: one kernel.
+            self.assertFalse(pays(8 * 14 * 14, 1024))
+            self.assertFalse(pays(96 * 8 * 8, 256))
+            # Below MIN_LAYOUT_SPLIT_VALUES: one kernel, whatever the rdim.
+            self.assertFalse(pays(64 * 64 * 64, 2))
+        # The Triton backend splits from MIN_LAYOUT_SPLIT_VALUES on, whatever
+        # the rdim.
+        with helion_config.patch(backend="triton"):
+            self.assertTrue(pays(8 * 14 * 14, 1024))
+            self.assertFalse(pays(64 * 64 * 64, 2))
+
     def test_layout_split_of_the_node(self):
         # layout_split() of the sum over N and W of a bf16 [4, 8, 94828] that
         # V.graph.current_node lowers: its 4 runs of W per channel, cut in

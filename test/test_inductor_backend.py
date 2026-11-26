@@ -1000,10 +1000,11 @@ class TestInductorCute(InductorBackendTestCase):
         with config.patch(assert_indirect_indexing=False):
             sources = self.compile(gathered_sum, table, idx, tol=1e-3, backend="cute")
         self.assertFalse(any("tile_q" in source for source in sources))
-        # A variance over runs of 640, 2**20 values or more, whose reductions
-        # one kernel would leave to the flat rdim: the layout split reads the
-        # runs as views (reads_runs()), with no // of the flat rdim.
-        x = torch.randn(4, 512, 640, device=DEVICE)
+        # A variance over runs of 640, 2**21 values or more (layout_split_pays()),
+        # whose reductions one kernel would leave to the flat rdim: the layout
+        # split reads the runs as views (reads_runs()), with no // of the flat
+        # rdim.
+        x = torch.randn(8, 512, 640, device=DEVICE)
         sources = self.compile(centered_square_sum, x, tol=1e-3, backend="cute")
         self.assertFalse(any("//" in source for source in sources))
 
@@ -1233,6 +1234,49 @@ class TestInductorCute(InductorBackendTestCase):
 
     def test_cat_spans(self):
         check_cat_spans(self, "cute")
+
+    def test_short_rdims_stay_unsplit(self):
+        # 1.6M values over rdims of 1568, which the CuTe backend's unsplit
+        # kernel reduces each in one CTA faster than the layout split's two
+        # kernels (HelionChoices.layout_split_pays()): one kernel.
+        x = torch.randn(8, 1024, 14, 14, device=DEVICE)
+        var_mean = lambda x: torch.var_mean(x, [0, 2, 3], correction=0)  # noqa: E731
+        self.assertEqual(len(self.compile(var_mean, x, tol=1e-3, backend="cute")), 1)
+
+    def test_unsplit_layouts_carry_their_merges(self):
+        # A BatchNorm's normalize over N, H and W of a float32 [24, 1024, 7, 7],
+        # 1.2M values over rdims of 1176 that layout_split_pays() leaves whole:
+        # one kernel that loops over the rdim, whose merges carry their rounding
+        # (acc3, acc4; welford()). With plain merges, 1000 + 0.01 * randn()
+        # normalized at 3.5x eager's error; with the carries below it. A
+        # var_mean over a contiguous rdim, which never took the layout split,
+        # keeps the plain merges.
+        def normalize(x):
+            var, mean = torch.var_mean(x, [0, 2, 3], correction=0, keepdim=True)
+            return (x - mean) * torch.rsqrt(var + 1e-5)
+
+        def spacings(result: torch.Tensor, ref: torch.Tensor) -> float:
+            # The mean error in spacings of float32 at the float64 reference.
+            r = ref.float().abs()
+            spacing = torch.nextafter(r, torch.full_like(r, float("inf"))) - r
+            return ((result.double() - ref).abs() / spacing.double()).mean().item()
+
+        x = 1000 + 0.01 * torch.randn(24, 1024, 7, 7, device=DEVICE)
+        expected = normalize(x.double())
+        (source,) = self.compile(
+            normalize, x, expected=expected.float(), tol=2e-1, backend="cute"
+        )
+        self.assertIn("for tile_r in hl.tile(1176)", source)
+        self.assertIn(" - acc3", source)
+        self.assertIn(" - acc4", source)
+        eager = spacings(normalize(x), expected)
+        self.assertLess(spacings(self.result, expected), eager + 1)
+        y = torch.randn(64, 12544, device=DEVICE)
+        var_mean = lambda y: torch.var_mean(y, -1, correction=0)  # noqa: E731
+        with config.patch({"triton.persistent_reductions": False}):
+            (source,) = self.compile(var_mean, y, tol=1e-3, backend="cute")
+        self.assertIn("for tile_r in hl.tile(12544)", source)
+        self.assertNotIn("acc3", source)
 
     def test_window_spans(self):
         check_window_spans(self, "cute")
