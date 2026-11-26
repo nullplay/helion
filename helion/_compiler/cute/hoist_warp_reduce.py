@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
+import dataclasses
 import re
 from typing import TYPE_CHECKING
 from typing import cast
@@ -53,6 +54,7 @@ from ._ast_pass_utils import constexpr_v_loop
 from ._ast_pass_utils import loop_extent
 from ._ast_pass_utils import names_read
 from ._ast_pass_utils import names_written
+from ._ast_pass_utils import tensor_roots_may_alias
 from .reduce_call import CLUSTER_REDUCES
 from .reduce_call import LANE_FOLD_REDUCES
 from .reduce_call import extremum_carrier
@@ -293,6 +295,7 @@ def _try_hoist_one_vloop(
     acc_name_counter: list[int],
     running_sums: set[str],
     input_dtypes: Mapping[str, str | None] | None = None,
+    tensors: KernelTensors | None = None,
 ) -> list[ast.stmt] | None:
     """Try to hoist warp reductions out of a single constexpr V-loop.
 
@@ -403,16 +406,23 @@ def _try_hoist_one_vloop(
     # loads, when the loop holds one reduction (element_store()). A later
     # fold loop would load its elements after every store of the first one,
     # where a buffer Inductor updates in place reads the stored value: with
-    # two reductions, a store keeps the loop.
+    # two reductions, a store keeps the loop, unless its tensor is proven
+    # apart from every tensor the loop reads (KernelTensors.store_keeps_loads():
+    # a looped Welford's chunk mean and m2 beside the store of a cat's
+    # elements, read from other tensors).
     single_reduction = len(reduce_validate) == 1
     side = [
         i
         for i in range(reduce_validate[0][0])
         if i in v_dependent and i not in all_closures
     ]
-    if not all(
-        _is_side_computation(body[i]) or (single_reduction and element_store(body[i]))
-        for i in side
+    stores = [i for i in side if element_store(body[i])]
+    if not all(_is_side_computation(body[i]) or i in stores for i in side):
+        return None
+    if (
+        stores
+        and not single_reduction
+        and (tensors is None or not tensors.store_keeps_loads(body, stores))
     ):
         return None
     # Between two reductions such a statement would run in no fold loop, and
@@ -674,6 +684,52 @@ def _is_side_computation(stmt: ast.stmt) -> bool:
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class KernelTensors:
+    """The kernel's tensor arguments, and the pairs of them proven not to
+    alias (``DeviceFunction.proven_disjoint_tensor_pairs()``)."""
+
+    names: frozenset[str]
+    disjoint: frozenset[frozenset[str]]
+
+    def store_keeps_loads(self, body: list[ast.stmt], stores: list[int]) -> bool:
+        """Whether each element store ``body[i]`` (``i`` in ``stores``)
+        writes one tensor argument that no other statement of ``body``, nor
+        any store's value or mask, may read: one the rest names neither
+        itself nor through a tensor argument not proven disjoint from it.
+        A fold loop after the first runs its elements' loads again after
+        every store of the first, and reads what the V-loop read then."""
+        written: set[str] = set()
+        read: set[str] = set()
+        for index, stmt in enumerate(body):
+            if index not in stores:
+                read |= names_read(stmt) & self.names
+                continue
+            pointer, rest = _store_parts(stmt)
+            targets = names_read(pointer) & self.names
+            if len(targets) != 1:
+                return False
+            written |= targets
+            for part in rest:
+                read |= names_read(part) & self.names
+        return not tensor_roots_may_alias(
+            frozenset(written), frozenset(read), self.disjoint
+        )
+
+
+def _store_parts(stmt: ast.stmt) -> tuple[ast.expr, list[ast.expr]]:
+    """The pointer of the element store ``stmt`` (``element_store()``), and
+    its value and mask."""
+    test: list[ast.expr] = []
+    if isinstance(stmt, ast.If):
+        test = [stmt.test]
+        stmt = stmt.body[0]
+    assert isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+    store = stmt.value
+    assert isinstance(store.func, ast.Attribute)
+    return store.func.value, [*store.args, *test]
+
+
 def element_store(stmt: ast.stmt) -> bool:
     """Whether ``stmt`` stores one value through a pointer,
     ``ptr.store(value)``, or does so under a mask, ``if mask: ptr.store(value)``
@@ -929,7 +985,9 @@ def _per_lane_reduce_escape(
     last lane's share of the sum over the whole count: at four V lanes of
     1024 threads over a block of 4096, the mean of 3136 values of x + 1 came
     out 0.2. (A chunk loop that also stores a value keeps its two reductions
-    in the V-loop, see _try_hoist_one_vloop().)
+    in the V-loop where the store's tensor is not proven apart from the
+    loop's reads, KernelTensors.store_keeps_loads(); see
+    _try_hoist_one_vloop().)
     """
     if not (
         isinstance(vloop.target, ast.Name) and vloop.target.id.startswith("vec_lane")
@@ -1001,6 +1059,7 @@ def _hoist_in_body(
     unfoldable_vec_lanes: set[str],
     input_dtypes: Mapping[str, str | None],
     extent_names: frozenset[str] = frozenset(),
+    tensors: KernelTensors | None = None,
 ) -> list[ast.stmt]:
     """Walk ``body`` recursively; for each constexpr V-loop containing warp
     reductions, replace it with the V-fold + hoisted-reduce form.  A V-loop
@@ -1018,6 +1077,7 @@ def _hoist_in_body(
             unfoldable_vec_lanes,
             input_dtypes,
             extents,
+            tensors,
         )
 
     new_body: list[ast.stmt] = []
@@ -1037,7 +1097,7 @@ def _hoist_in_body(
             ):
                 vloop, v = match
                 replacement = _try_hoist_one_vloop(
-                    vloop, v, acc_counter, running_sums, input_dtypes
+                    vloop, v, acc_counter, running_sums, input_dtypes, tensors
                 )
                 if replacement is not None:
                     new_body.extend(replacement)
@@ -1067,6 +1127,7 @@ def hoist_warp_reduce_from_vloop(
     rename_groups: dict[str, str] | None = None,
     unfoldable_vec_lanes: set[str] | None = None,
     reduce_input_dtypes: Mapping[str, str | None] | None = None,
+    tensors: KernelTensors | None = None,
 ) -> list[ast.stmt]:
     """Apply the hoist pass to a list of kernel-body statements.
 
@@ -1094,6 +1155,11 @@ def hoist_warp_reduce_from_vloop(
     of an integer of at most 32 bits is held in a float that holds it and
     converted back for the reduce (``_fold_carrier``).
 
+    ``tensors`` names the kernel's tensor arguments and the pairs proven not
+    to alias: a V-loop with two reductions and an element store folds when
+    the store's tensor is apart from every tensor the loop reads
+    (``KernelTensors.store_keeps_loads()``); without it such a loop stays.
+
     After the per-V-loop hoist, a second walk collapses the remaining
     per-lane-iteration reduces: a static lane loop that runs ``REDUCE`` +
     ``carry = combine(carry, result)`` once per iteration is rewritten to
@@ -1107,6 +1173,7 @@ def hoist_warp_reduce_from_vloop(
         running_sum_accumulators or set(),
         unfoldable_vec_lanes or set(),
         reduce_input_dtypes or {},
+        tensors=tensors,
     )
     return _collapse_in_body(new_body, new_body, rename_groups or {})
 

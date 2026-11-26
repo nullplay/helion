@@ -385,6 +385,7 @@
  "test/test_cute_unpadded_rows.py": 10.5,
  "test/test_cute_unsigned_reductions.py": 6.5,
  "test/test_cute_vec_hoist_memory_effects.py": 7.1,
+ "test/test_cute_vector_lane_partials.py": 15.8,
  "test/test_cute_vector_lane_reduction.py": 7.1,
  "test/test_cute_vloop_loads_first.py": 1.0,
  "test/test_cute_vloop_sink.py": 10.6,
