@@ -353,6 +353,47 @@ def test_sibling_seeds_configure_all_passes_by_block_id(
             assert tile_loop_thread_count(env, ir, ir.graphs, seed) <= 1024
 
 
+@pytest.mark.parametrize(
+    ("columns", "dtype", "vec"), ((6144, torch.bfloat16, 8), (3000, torch.float32, 4))
+)
+def test_sibling_seeds_hold_a_masked_row_as_one_packet_per_thread(
+    columns: int, dtype: torch.dtype, vec: int
+) -> None:
+    # Rows of 6144 bf16 (3000 float32) round up to 8192 (4096): 1024 threads
+    # of one packet each cover them, where fewer threads fold several packets
+    # over the masked tail, which the CuTe backend refuses.
+    ir = _row_ir(columns=columns, dtype=dtype)
+    with _context(ir, Config(block_sizes=[16, 16, 16]), (16, columns, columns)) as (
+        env,
+        fn,
+    ):
+        extent = 1024 * vec
+        seeds = CuteSiblingRowHeuristic.get_seed_configs(env, ir)
+        assert any(
+            seed.block_sizes == [1, extent, extent]
+            and seed.num_threads == [1, 1024, 1024]
+            and seed.config["cute_vector_widths"][1:] == [vec, vec]
+            and "cute_independent_reduction" not in seed.config
+            for seed in seeds
+        )
+        for seed in seeds:
+            assert tile_loop_thread_count(env, ir, ir.graphs, seed) <= 1024
+
+
+@pytest.mark.parametrize("columns", (12000, 40000))
+def test_sibling_seeds_give_1024_threads_only_one_packet_each(columns: int) -> None:
+    # Rows of 12000 (40000) bf16 round up to 16384 (65536): 1024 threads would
+    # hold 2 (8) packets each, and for 65536 no other thread count fits 64
+    # elements a thread, so such a seed would come first.
+    ir = _row_ir(columns=columns, dtype=torch.bfloat16)
+    with _context(ir, Config(block_sizes=[16, 16, 16]), (16, columns, columns)) as (
+        env,
+        fn,
+    ):
+        seeds = CuteSiblingRowHeuristic.get_seed_configs(env, ir)
+        assert not any(seed.num_threads[1:] == [1024, 1024] for seed in seeds)
+
+
 @pytest.mark.parametrize("case", ("nested", "different_bounds", "rolled_reduction"))
 def test_sibling_seeds_require_matching_row_passes(case: str) -> None:
     ir = _row_ir(
