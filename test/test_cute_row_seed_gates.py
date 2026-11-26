@@ -50,6 +50,7 @@ from helion._testing.cute_row_seed_kernels import row_norm_then_grid_doubled_row
 from helion._testing.cute_row_seed_kernels import row_norm_then_grid_row_norm
 from helion._testing.cute_row_seed_kernels import row_norm_then_tiled_columns
 from helion._testing.cute_row_seed_kernels import row_norm_then_tiled_doubled_rows
+from helion._testing.cute_row_seed_kernels import row_norm_with_running_mean
 from helion._testing.cute_row_seed_kernels import rows_over_two_sums
 from helion._testing.cute_row_seed_kernels import softmax_rows
 from helion._testing.cute_row_seed_kernels import softmax_rows_inner_block_size_first
@@ -349,7 +350,8 @@ def test_warp_rows_take_the_innermost_tile_axis() -> None:
 # beside a second reduced block, its count drops here and the gate, which
 # would then withhold a seed that compiles, is due for another look.
 # ``knob`` says whether the loads-first rows, which need one tile axis and a
-# row store, keep their knob.
+# row store, keep their knob.  A row shorter than the loads-first chunk gets
+# a second seed there, its one-trip chunk (``get_seed_configs``).
 @pytest.mark.parametrize(
     ("kernel", "shapes", "row", "reduced", "knob", "ungated"),
     [
@@ -362,7 +364,7 @@ def test_warp_rows_take_the_innermost_tile_axis() -> None:
             {
                 "cute_reduction_tile": (4, 4),
                 "cute_rolled_row_ladder": (1, 1),
-                "cute_rolled_row_loads_first": (1, 1),
+                "cute_rolled_row_loads_first": (2, 2),
             },
             id="half row beside the row",
         ),
@@ -375,7 +377,7 @@ def test_warp_rows_take_the_innermost_tile_axis() -> None:
             {
                 "cute_reduction_tile": (1, 1),
                 "cute_rolled_row_ladder": (1, 1),
-                "cute_rolled_row_loads_first": (1, 1),
+                "cute_rolled_row_loads_first": (2, 2),
             },
             id="half row reduced first",
         ),
@@ -388,7 +390,7 @@ def test_warp_rows_take_the_innermost_tile_axis() -> None:
             {
                 "cute_reduction_tile": (4, 4),
                 "cute_rolled_row_ladder": (1, 1),
-                "cute_rolled_row_loads_first": (1, 1),
+                "cute_rolled_row_loads_first": (2, 2),
             },
             id="rows of a second tensor",
         ),
@@ -707,3 +709,16 @@ def test_row_loop_without_a_reduction_is_found_by_its_rolled_slice(
     # Without the gate the warp rows hold 2 and 4 "rows" of that other loop.
     warp_rows = _ungated(monkeypatch, bound)["cute_reduction_tile"][-2:]
     assert [seed.config["block_sizes"] for seed in warp_rows] == [[2], [4]]
+
+
+def test_a_row_shorter_than_the_loads_first_chunk_gets_its_one_trip_chunk() -> None:
+    """Rows of 392 elements beside an in-place running mean: the
+    loads-first chunk of 2048 normalizes to a persistent row, which the
+    lowering refuses with the in-place update, and the row's own power of
+    two, one trip of the rolled loop, renders."""
+    bound = _bind(row_norm_with_running_mean, (2048, 392), (2048,))
+    seeds = _seeds(CuteRolledRowLoadsFirstHeuristic, bound)
+    chunks = [seed.config["reduction_loops"] for seed in seeds]
+    assert chunks == [[2048], [512]]
+    assert _refusal(bound, seeds[0]) is not None
+    assert _refusal(bound, seeds[1]) is None
