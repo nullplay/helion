@@ -390,6 +390,10 @@ def exact_cast(src: torch.dtype | None, dst: torch.dtype | None) -> bool:
 # element four times over, where its [1024, 4] tile stores them in one run.
 RDIM_SEGMENTS_MAX = 4
 RDIM_SEGMENT_MIN = 16
+# The boundary, in bytes, that the spans of a view of spans
+# (HelionKernel.span_subscript()) must start on: the width of the widest packet
+# a lane loads.
+SPAN_ALIGNMENT = 16
 
 
 def as_less(relation: sympy.Rel) -> tuple[sympy.Basic, sympy.Basic, bool]:
@@ -1052,15 +1056,17 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         *,
         output: bool = False,
         bounds: dict[str, sympy.Expr] | None = None,
+        spans: bool = True,
     ) -> tuple[HelionTensorArg, list[str], TileShape]:
         """The parameter and subscript that read `buffer` at `index`, and its shape.
 
         Tries an rdim segment's slice of the whole rdim (segment_subscript()), the
         buffer's own dims (dropping size-1 dims the index skips) or a
         tiled_view() (tiled_subscript()), for a load a gather_subscript() or a
-        quotient_subscript(), then a flat_subscript(). `bounds` are the extents a
-        masked load's mask bounds its tiles to (masked_extents()): the view
-        need only cover those, as the pad of x from 30522 to 30528 reads
+        quotient_subscript(), a span_subscript() unless `spans` is off, then a
+        flat_subscript(). `bounds` are the extents a masked load's mask bounds
+        its tiles to (masked_extents()): the view need only cover those, as the
+        pad of x from 30522 to 30528 reads
             tmp5 = hl.load(in0, [tile_y, tile_x], extra_mask=tmp4)
         of in0 [16384, 30522], where without them the view of an x of 30528
         would run past the storage and the load be flat:
@@ -1079,6 +1085,8 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             return gather
         if not output and (quotient := self.quotient_subscript(buffer, index, axes)):
             return quotient
+        if spans and (span := self.span_subscript(buffer, index, axes, output)):
+            return span
         return self.flat_subscript(buffer, index, axes, output=output)
 
     def tiled_subscript(
@@ -1219,15 +1227,17 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         axes: Sequence[str],
         lead: tuple[sympy.Symbol, sympy.Expr, str],
         lead_axes: Sequence[str],
+        output: bool = False,
     ) -> tuple[HelionTensorArg, list[str], TileShape] | None:
         """The parameter, subscript and shape that read `buffer` at `index`
         through a view whose first dim a leading index indexes, `lead`: its
         symbol in `index`, the dim's size and its code, a value read from
-        memory (gather_subscript()) or a tile's quotient (quotient_subscript()).
-        The view's other dims are the tiles of `axes` the leading index's
-        tiles `lead_axes` leave, which must come after those in the kernel's
-        axis order: Helion puts the leading index's tiles first in the
-        result."""
+        memory (gather_subscript()), a tile's quotient (quotient_subscript())
+        or the span the other tiles select (span_subscript()). The view's
+        other dims are the tiles of `axes` the leading index's tiles
+        `lead_axes` leave, which must come after those in the kernel's axis
+        order: Helion puts the leading index's tiles first in the result. An
+        `output` view is a parameter written."""
         symbol, size, code = lead
         other = [axis for axis in axes if axis not in lead_axes]
         if [axis for axis in self.axes if axis in axes] != [*lead_axes, *other]:
@@ -1242,7 +1252,120 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             return None
         tiles = [TILE_NAMES[axis] for axis in other]
         coordinates = [code, *map(self.coordinate, tiles)]
-        return self.tensor_arg(view), coordinates, self.value_shape(axes)
+        return self.tensor_arg(view, output=output), coordinates, self.value_shape(axes)
+
+    def span_subscript(
+        self,
+        buffer: IRNode,
+        index: sympy.Expr,
+        axes: Sequence[str],
+        output: bool = False,
+    ) -> tuple[HelionTensorArg, list[str], TileShape] | None:
+        """The parameter, subscript and shape that read (or, for an `output`,
+        write) `buffer` at an index that adds the innermost tile's index, with
+        coefficient 1, to an offset the other tiles select that is a multiple
+        of the innermost tile's extent: a view of the storage as spans of that
+        extent, whose first dim the offset's span indexes. Swin's window
+        partition after a roll, over [28672, 7, 128] tiles, reads its
+        LayerNorm's input flat at 128 times the rolled, windowed token plus x,
+            in0[(128*(((3 + tile_y.index.reshape([tile_y, 1]) + 7*((
+                tile_z.index.reshape([tile_z, 1, 1]) % 8))) % 56)) + ...)
+                + tile_x.index]
+        one element per lane, where the [200704, 128] view subscripted by the
+        token's span and the tile,
+            in0[((3 + tile_y.index + 7*((tile_z.index.reshape([tile_z, 1])
+                % 8))) % 56) + ..., tile_x]
+        reads 128 consecutive elements a span, which the backend vectorizes;
+        its store of each window's tokens likewise. A persistent rdim is the
+        innermost tile as well: in1[span, :]. A store in a kernel emitted over
+        segments keeps the flat index (store() passes `spans` off): the CuTe
+        backend cannot tell apart the spans of the segments' stores to one
+        output, as a cat's parts at spans 0, 4 and 8 of each 36-wide span set,
+        and refuses their lane loops ("an access of out0 ... conflicts with
+        another access of it across the lanes of one lane loop"). An access in
+        the loop over tile_r keeps its flat index, which the backend's V-loop
+        sink already reads in packets there (and with the config's load
+        eviction policy, which its packets of a span's view do not take: a
+        reduction over a cat of [36, 1536] parts read 8.5% slower so), as does
+        a looped rdim, and so does a load that a mask turns off on every lane
+        (load() passes `spans` off)."""
+        if self.rolled:
+            return None
+        scope = [axis for axis in self.axes if axis in axes]
+        if len(scope) < 2 or self.indirect_vars(index):
+            return None
+        inner = scope[-1]
+        length = self.extents[inner]
+        if not isinstance(length, (int, sympy.Integer)) or length < 2:
+            return None
+        lane = self.symbols[inner]
+        rest = sympy.expand(sympy.Add(index, sympy.Mul(sympy.S.NegativeOne, lane)))
+        lead_axes = [
+            axis for axis in scope[:-1] if self.symbols[axis] in rest.free_symbols
+        ]
+        if not lead_axes or lane in rest.free_symbols:
+            return None
+        constant, _ = rest.as_coeff_Add()
+        if not isinstance(constant, sympy.Integer):
+            return None
+        start = int(constant) % int(length)
+        # The view's spans start every `length` elements from `start`. Only
+        # where those starts fall on SPAN_ALIGNMENT does the view let the
+        # backend read a span's elements in full packets, as Swin's spans of
+        # 128 bf16 elements do (in0[span, tile_x]: 8 elements a packet). Spans
+        # of 257 bf16 elements (514 bytes) are read one element a lane as the
+        # flat index is, only through the view's strides,
+        #     tmp0 = in0[(tile_z.index % 256), tile_x]
+        # for in0[tile_x.index + 257*((tile_z.index.reshape([tile_z, 1]) %
+        # 256))], and spans of 6156 (12312 bytes, every other one 8 bytes off)
+        # in packets of at most 8 bytes. Both keep the flat index, whose code,
+        # and autotune cache entries, the view would change for no full packet.
+        itemsize = buffer.get_dtype().itemsize
+        if (int(length) * itemsize) % SPAN_ALIGNMENT or (
+            start * itemsize
+        ) % SPAN_ALIGNMENT:
+            return None
+        span = sympy.expand(
+            sympy.Mul(
+                sympy.Add(rest, sympy.Integer(-start)), sympy.Rational(1, int(length))
+            )
+        )
+        if not all(
+            isinstance(term, sympy.Expr) and term.as_coeff_Mul()[0].is_Integer
+            for term in sympy.Add.make_args(span)
+        ):
+            return None
+        size = buffer.get_layout().storage_size()
+        if not isinstance(size, (int, sympy.Integer)):
+            return None
+        head = sympy.Symbol("span", integer=True, nonnegative=True)
+        spans = sympy.Integer((int(size) - start) // int(length))
+        # The view holds the storage's whole spans from `start` on. A span the
+        # tiles' ranges can reach outside it keeps the flat index, whose bound
+        # is the storage's: below span 0 where the view starts past the
+        # storage's start (a left pad's valid elements before `start`, which
+        # a size-1 view would read at span 0), and past its last span where
+        # the storage ends in a partial span (a padded rdim's last elements).
+        # A view from the storage's start that holds every whole span reaches
+        # no valid element outside it: a span below 0 is before the storage.
+        reach = bound_sympy(span, self.value_ranges(lead_axes))
+        sizevars = V.graph.sizevars
+        if (start and not sizevars.statically_known_geq(reach.lower, 0)) or (
+            (int(size) - start) % int(length)
+            and not sizevars.statically_known_lt(reach.upper, spans)
+        ):
+            return None
+        code = self.index_tensor_expr(span, lead_axes)
+        return self.leading_subscript(
+            buffer,
+            sympy.Add(
+                sympy.Mul(head, sympy.Integer(length)), lane, sympy.Integer(start)
+            ),
+            axes,
+            (head, spans, code),
+            lead_axes,
+            output,
+        )
 
     def gather_subscript(
         self, buffer: IRNode, index: sympy.Expr, axes: Sequence[str]
@@ -1608,7 +1731,24 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             arg, coordinates, shape = self.flat_subscript(buffer, index, axes)
         else:
             bounds = None if mask is None else self.masked_extents(mask)
-            arg, coordinates, shape = self.subscript(buffer, index, axes, bounds=bounds)
+            # A load under a mask that the tiles' ranges prove false on every
+            # lane reads nothing: masked() takes `other` for its value and
+            # Helion drops the load. A cat's other parts are such loads within
+            # one part's tiles, as b's of cat([a, b], 1) over tiles of a's 256 y:
+            #     tmp9 = tmp0 >= tmp3                      # y >= 256
+            #     tmp17 = hl.load(in3, [((-16384)
+            #         + 64*tile_y.index.reshape([tile_y, 1])
+            #         + 16384*tile_z.index.reshape([tile_z, 1, 1]))
+            #         + tile_x.index], extra_mask=tmp9.reshape([tile_y, 1]))
+            # It keeps its flat index. As a span (span_subscript()),
+            #     tmp17 = hl.load(in3, [(-256) + tile_y.index
+            #         + 256*tile_z.index.reshape([tile_z, 1]), tile_x], ...)
+            # it compiles to the same code under every config, and changes only
+            # the kernel's source, which keys its autotune cache entries.
+            spans = not any(self.proven(guard) is False for guard in self.load_masks)
+            arg, coordinates, shape = self.subscript(
+                buffer, index, axes, bounds=bounds, spans=spans
+            )
         # A bf16 a in (a + 1).float() @ b is read as fp32, so that a + 1 is fp32 as
         # its CSE dtype says. Read as bf16, bf16 + hl.full([], 1.0, dtype=float32)
         # stays bf16 and the dot fails: "lhs and rhs bitwidth must be the same".
@@ -1695,7 +1835,12 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                 if axis not in ("q_", "r0_") or self.in_reduction
             )
         axes = [axis for axis in self.axes if axis in store_axes]
-        arg, coordinates, shape = self.subscript(buffer, index, axes, output=True)
+        # A kernel emitted over segments stores each segment's part through
+        # the flat index (span_subscript()), as does an atomic.
+        spans = mode is None and self.axis_segments is None and not self.segments
+        arg, coordinates, shape = self.subscript(
+            buffer, index, axes, output=True, spans=spans
+        )
         dtype = buffer.get_dtype()
         cast_suffix = "" if value.dtype == dtype else f".to({dtype})"
         buffer_code = self.compute if self.in_reduction else self.stores
