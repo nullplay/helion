@@ -132,6 +132,21 @@ MIN_SPLIT_RUN = 32
 # 8], 8192 values, keeps its one kernel, whose launch the second's would
 # double.
 MIN_LAYOUT_SPLIT_VALUES = 2**20
+# Below WIDE_LAYOUT_SPLIT_VALUES values, the layout split under the CuTe
+# backend also needs an rdim longer than MAX_UNSPLIT_RDIM
+# (layout_split_pays()): the unsplit kernel
+# reduces each output in one CTA, which reads a short rdim faster than the
+# split's two kernels and launch, and a long one slower (it then also has
+# fewer than 256 outputs to spread over the SMs). BatchNorms in training
+# over NCHW bf16 on a GB300 (full autotune, trace timer, unsplit vs split):
+# rdims of 1568-6144 over 192-1024 channels 0.68-0.86x the split's time
+# ([8, 1024, 14, 14] 6.19 vs 7.36 us, [96, 256, 8, 8] 5.26 vs 7.44, [8, 640,
+# 16, 16] 3.94 vs 5.81); rdims of 9408-32768 over 32-160 channels mostly
+# 1.25-2.2x ([16, 96, 28, 28] 10.25 vs 6.44, [128, 32, 16, 16] 14.35 vs
+# 6.67), two of seven searches drawing a faster unsplit config; from 2.3M
+# values the split wins ([18, 512, 16, 16] 10.06 vs 7.58).
+WIDE_LAYOUT_SPLIT_VALUES = 2**21
+MAX_UNSPLIT_RDIM = 8192
 # The reductions HelionKernel reads as a tile of their runs (rdim_runs()):
 # those whose partials of the runs combine as their blocks' do.
 RUN_REDUCTIONS = OrderedSet(
@@ -1105,7 +1120,7 @@ class HelionChoices(InductorChoices):
         if layout is not None and (
             split > 1
             or (
-                reduction_numel_hint * numel_hint >= MIN_LAYOUT_SPLIT_VALUES
+                HelionChoices.layout_split_pays(reduction_numel_hint, numel_hint)
                 and not HelionChoices.reads_runs(layout)
             )
         ):
@@ -1120,20 +1135,38 @@ class HelionChoices(InductorChoices):
         return min(divisors, key=lambda d: abs(d - split), default=split)
 
     @staticmethod
+    def layout_split_pays(reduction_numel: int, numel: int) -> bool:
+        """Whether a reduction Inductor would not split reads enough values
+        for the layout split's second kernel to pay: MIN_LAYOUT_SPLIT_VALUES
+        or more. Under the CuTe backend, whose unsplit kernel loads an NCHW
+        flat tile's lanes as packets and reduces each output in one CTA,
+        WIDE_LAYOUT_SPLIT_VALUES or more, or MIN_LAYOUT_SPLIT_VALUES or more
+        over rdims longer than MAX_UNSPLIT_RDIM; the evidence for that bound
+        (WIDE_LAYOUT_SPLIT_VALUES) is the CuTe backend's alone."""
+        values = reduction_numel * numel
+        if config.backend != "cute":
+            return values >= MIN_LAYOUT_SPLIT_VALUES
+        return values >= WIDE_LAYOUT_SPLIT_VALUES or (
+            values >= MIN_LAYOUT_SPLIT_VALUES and reduction_numel > MAX_UNSPLIT_RDIM
+        )
+
+    @staticmethod
     def reads_runs(runs: int) -> bool:
         """Whether the reduction V.graph.current_node lowers, over `runs` runs
         of its input (layout_split()), is one HelionKernel reads as a tile of
         its runs (HelionKernel.rdim_runs()): a sum, mean, prod, amax, amin or
-        any over at most REDUCTION_RUNS_MAX runs. Where Inductor would not
-        split such a reduction, it keeps its one kernel rather than take the
-        layout split: the sum over N and W of a [4, 1024, 364] bf16 tensor
-        beside its masked copy (Demucs's sum_a05c10ed018a) read the runs
-        side by side in one kernel of 2.30 us on a GB300, where the split's
-        two kernels took 1.82 and 1.09 us and a launch. Under the CuTe
-        backend, not one whose input reads another reduction (the sum of (x -
-        x.mean(...)) ** 2, a variance): HelionKernel.rdim_runs() leaves such a
-        kernel to the flat rdim there, and the layout split reads its runs as
-        views."""
+        any over at most REDUCTION_RUNS_MAX runs. Where Inductor would not split
+        such a reduction and the layout split would pay (layout_split_pays()),
+        it keeps its one kernel rather than take the layout split: the sum over
+        N and W of a [4, 1024, 364] bf16 tensor beside its masked copy (Demucs's
+        sum_a05c10ed018a, whose 1.5M values over rdims of 1456
+        layout_split_pays() now leaves unsplit under the CuTe backend before
+        this is asked) read the runs side by side in one kernel of 2.30 us on a
+        GB300, where the split's two kernels took 1.82 and 1.09 us and a launch.
+        Under the CuTe backend, not one whose input reads another reduction (the
+        sum of (x - x.mean(...)) ** 2, a variance): HelionKernel.rdim_runs()
+        leaves such a kernel to the flat rdim there, and the layout split, where
+        it pays, reads its runs as views."""
         node = V.graph.current_node
         return (
             runs <= REDUCTION_RUNS_MAX
@@ -1163,8 +1196,8 @@ class HelionChoices(InductorChoices):
         split is asked of whether Inductor would split (one kernel reduces
         over N and H * W apart only as a tile of their runs,
         HelionKernel.rdim_runs(); reduction_split_factor() takes the split
-        where Inductor would not only for MIN_LAYOUT_SPLIT_VALUES values or
-        more, and not where the kernel reads the runs as that tile,
+        where Inductor would not only where layout_split_pays(), and not
+        where the kernel reads the runs as that tile,
         reads_runs()), but not of the second reduction, over the partials,
         nor of another reduction than the node's own: None then, and when the
         run is the whole reduction (a contiguous rdim), shorter than

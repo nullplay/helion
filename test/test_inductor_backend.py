@@ -1000,10 +1000,11 @@ class TestInductorCute(InductorBackendTestCase):
         with config.patch(assert_indirect_indexing=False):
             sources = self.compile(gathered_sum, table, idx, tol=1e-3, backend="cute")
         self.assertFalse(any("tile_q" in source for source in sources))
-        # A variance over runs of 640, 2**20 values or more, whose reductions
-        # one kernel would leave to the flat rdim: the layout split reads the
-        # runs as views (reads_runs()), with no // of the flat rdim.
-        x = torch.randn(4, 512, 640, device=DEVICE)
+        # A variance over runs of 640, 2**21 values or more (layout_split_pays()),
+        # whose reductions one kernel would leave to the flat rdim: the layout
+        # split reads the runs as views (reads_runs()), with no // of the flat
+        # rdim.
+        x = torch.randn(8, 512, 640, device=DEVICE)
         sources = self.compile(centered_square_sum, x, tol=1e-3, backend="cute")
         self.assertFalse(any("//" in source for source in sources))
 
@@ -1233,6 +1234,14 @@ class TestInductorCute(InductorBackendTestCase):
 
     def test_cat_spans(self):
         check_cat_spans(self, "cute")
+
+    def test_short_rdims_stay_unsplit(self):
+        # 1.6M values over rdims of 1568, which the CuTe backend's unsplit
+        # kernel reduces each in one CTA faster than the layout split's two
+        # kernels (HelionChoices.layout_split_pays()): one kernel.
+        x = torch.randn(8, 1024, 14, 14, device=DEVICE)
+        var_mean = lambda x: torch.var_mean(x, [0, 2, 3], correction=0)  # noqa: E731
+        self.assertEqual(len(self.compile(var_mean, x, tol=1e-3, backend="cute")), 1)
 
     def test_window_spans(self):
         check_window_spans(self, "cute")
