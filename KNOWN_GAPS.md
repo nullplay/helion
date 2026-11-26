@@ -309,7 +309,9 @@ these labelled lines.
   `count` are per-row values (`hl.zeros` of `[tile_m]`) that start ahead of
   the column loop and are stored after it. (The store and one reduction,
   `total = v.sum(-1)` alone, fold since the pass runs a loop's stores in its
-  fold loop.)
+  fold loop. Inductor's looped Welford beside a store, whose per-lane merge
+  reads the tile's count, `tile_r.end - tile_r.begin`, is refused:
+  `_per_lane_reduce_escape()`.)
 
   ```python
   # the write is placed ahead of the tile's loads
