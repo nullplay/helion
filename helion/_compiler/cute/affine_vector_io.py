@@ -60,7 +60,10 @@ from ..ast_read_writes import ReadWrites
 from ..compile_environment import CompileEnvironment
 from ._ast_pass_utils import COMPARISON_CALLS
 from ._ast_pass_utils import _bound_names
+from .cache_policy_loads import MASKED_PACKET_LOAD_HELPERS
+from .lane_invariant_division import divided_vector_loops
 from .memory_ops import tensor_proven_base_alignment
+from .packet_access import render_masked_packet_load
 from .persistent_branch_vec import _DTYPE_INFO
 from .persistent_branch_vec import _and_terms
 from .persistent_branch_vec import _binding_write_roots
@@ -80,6 +83,7 @@ from .scalar_recipe import PURE_HELPERS
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Mapping
 
     from ..device_function import DeviceFunction
     from .bounded_loop_cache import OwnedFragment
@@ -114,6 +118,10 @@ _CASTS = frozenset(
     )
 )
 _COORDINATE_CALLS = frozenset(("cute.arch.thread_idx", "cute.arch.block_idx"))
+# The integer remainder the printer emits for an index's ``%``: an
+# ``i % d`` whose lane-invariance proof (``lane_invariant_division``) took
+# the remainder at the fragment's first lane, ``(base % d) + lane``.
+_PYTHON_MOD = "_cute_python_mod"
 # The names of _ast_pass_utils.COMPARISON_CALLS, for the set unions below.
 _COMPARISON_CALLS = frozenset(COMPARISON_CALLS)
 # Elementwise ``cute.math`` calls, including the fast-math forms the setting
@@ -429,6 +437,21 @@ def _conjunction(values: list[ast.expr]) -> ast.expr | None:
     return ast.BoolOp(op=ast.And(), values=terms)
 
 
+def _masked_packet(pointer: str, predicate: str, width: int, dtype: str) -> str:
+    """The packet of ``width`` elements of ``dtype`` (a ``_DTYPE_INFO`` key)
+    at ``pointer`` where ``predicate`` holds, zeros where it does not
+    (``masked_packet_load``), loaded as its store carrier's integers."""
+    carrier, itemsize, _ = _DTYPE_INFO[dtype]
+    return render_masked_packet_load(
+        MASKED_PACKET_LOAD_HELPERS[width * itemsize],
+        pointer,
+        predicate,
+        width,
+        carrier,
+        "",
+    )
+
+
 def _expression_reads(value: ast.expr) -> frozenset[str]:
     return frozenset(ReadWrites.from_ast(value).reads)
 
@@ -691,8 +714,13 @@ class _Vectorizer:
         register_accesses: frozenset[str] = frozenset(),
         unshadowed_abs: bool = False,
         store_tiers: bool = False,
+        divided: Mapping[int, ast.For] | None = None,
     ) -> None:
         self.store_tiers = store_tiers
+        # ``lane_invariant_division.divided_vector_loops``: the copy of a
+        # vector loop whose lane quotients and remainders divide the lane
+        # base, by the ``id`` of the loop, tried where the loop declines.
+        self.divided = dict(divided or {})
         self.strides = strides
         self.alignments = alignments
         self.dtypes = dtypes
@@ -832,6 +860,17 @@ class _Vectorizer:
             and not node.keywords
         ):
             return self.divisible(node.args[0], width, definitions, multiples, active)
+        if (
+            isinstance(node, ast.Call)
+            and ast.unparse(node.func) == _PYTHON_MOD
+            and len(node.args) == 2
+            and not node.keywords
+        ):
+            # a % d = a - d * (a // d): a multiple of width when a and d are.
+            return all(
+                self.divisible(arg, width, definitions, multiples, active)
+                for arg in node.args
+            )
         if isinstance(node, ast.BinOp):
             left = self.divisible(node.left, width, definitions, multiples, active)
             right = self.divisible(node.right, width, definitions, multiples, active)
@@ -1029,6 +1068,11 @@ class _Vectorizer:
                         and not item.args
                         and not item.keywords
                     )
+                    and not (
+                        ast.unparse(item.func) == _PYTHON_MOD
+                        and len(item.args) == 2
+                        and not item.keywords
+                    )
                     for item in ast.walk(candidate)
                 ):
                     raise _Decline
@@ -1172,8 +1216,37 @@ class _Vectorizer:
             # Whether a store whose alignment this tier checks at run time
             # has a narrower tier to fall back to.
             narrower_tier = False
+            # Loads under masks that differ (the parts of a cat, one active
+            # per channel): each loads its packet under its own mask when that
+            # is one value for the fragment, as no fragment would satisfy all.
+            predicate_loads = (
+                len(
+                    {
+                        ast.dump(
+                            _expand(site.mask, snapshots[site.statement], lane),
+                            include_attributes=False,
+                        )
+                        for site in sites
+                        if not site.store and site.mask is not None
+                    }
+                )
+                > 1
+            )
             for site, root in zip(sites, roots, strict=True):
                 assert root is not None
+                if (
+                    not site.store
+                    and lane
+                    not in ReadWrites.from_ast(
+                        _expand(site.pointer, snapshots[site.statement], lane)
+                    ).reads
+                ):
+                    # One address for every lane (a per-channel parameter
+                    # beside an NCHW tile): the scalar load stays where it
+                    # is, under its own predicate, and the lanes' copies of
+                    # it read one element.  The stores, which move after
+                    # the loop, write no tensor it reads (checked above).
+                    continue
                 dtype = self.dtypes[root]
                 info = _DTYPE_INFO.get(dtype)
                 if info is None:
@@ -1236,7 +1309,8 @@ class _Vectorizer:
                 offset = _expand(pointer.right, {}, lane, ast.Constant(value=0))
                 if set(ReadWrites.from_ast(offset).reads) & writes:
                     raise _Decline
-                if not self.divisible(offset, aligned_width, outer, multiples):
+                aligned = self.divisible(offset, aligned_width, outer, multiples)
+                if not aligned:
                     inactive_proven = False
                     narrower_tier |= splittable
                     alignment_guards.append(
@@ -1260,10 +1334,27 @@ class _Vectorizer:
                     writes,
                     int32_names,
                 )
-                guards.extend(site_guards)
-                inactive_proven &= uniform and site.mask is not None
-                if site.mask is not None:
-                    uniform_masks.append(_expand(site.mask, local, lane))
+                predicate: ast.expr | None = None
+                if (
+                    predicate_loads
+                    and not site.store
+                    and uniform
+                    and site_guards
+                    and aligned
+                    and not site_prefix_guards
+                    and memory_width * itemsize in MASKED_PACKET_LOAD_HELPERS
+                ):
+                    # One value for the whole fragment (the channel range of
+                    # one part of a cat, an aligned bound): the packet loads
+                    # under it, zeros where it is false, and the site's select
+                    # keeps choosing.
+                    predicate = _conjunction(site_guards)
+                    inactive_proven = False
+                else:
+                    guards.extend(site_guards)
+                    inactive_proven &= uniform and site.mask is not None
+                    if site.mask is not None:
+                        uniform_masks.append(_expand(site.mask, local, lane))
                 base = ast.BinOp(
                     left=_clone_expr(pointer.left), op=ast.Add(), right=offset
                 )
@@ -1329,6 +1420,8 @@ class _Vectorizer:
                         after.extend(ast.parse(f"{helper}({address}, {selected})").body)
                 else:
                     key = ast.dump(base, include_attributes=False) + dtype
+                    if predicate is not None:
+                        key += ast.dump(predicate, include_attributes=False)
                     loaded = vectors.get(key)
                     if loaded is None:
                         loaded = []
@@ -1339,11 +1432,14 @@ class _Vectorizer:
                             pointer = ast.unparse(base)
                             if start:
                                 pointer = f"({pointer}) + {start}"
-                            before.extend(
-                                ast.parse(
-                                    f"{vector} = cute.arch.load({pointer}, ir.VectorType.get([{memory_width}], {carrier}.mlir_type))"
-                                ).body
+                            load = (
+                                f"cute.arch.load({pointer}, ir.VectorType.get([{memory_width}], {carrier}.mlir_type))"
+                                if predicate is None
+                                else _masked_packet(
+                                    pointer, ast.unparse(predicate), memory_width, dtype
+                                )
                             )
+                            before.extend(ast.parse(f"{vector} = {load}").body)
                     selected = (
                         f"{loaded[0]}[{lane}]"
                         if len(loaded) == 1
@@ -1535,6 +1631,14 @@ class _Vectorizer:
                     active_multiples,
                     frozenset(active_int32_names),
                 )
+                divided = self.divided.get(id(statement))
+                if replacement is None and divided is not None:
+                    replacement = self.loop(
+                        divided,
+                        definitions,
+                        active_multiples,
+                        frozenset(active_int32_names),
+                    )
                 if replacement is not None:
                     result.extend(replacement)
                     continue
@@ -1723,6 +1827,9 @@ def vectorize_affine_tile_lanes(
             )
         ),
         store_tiers=store_tiers,
+        divided=divided_vector_loops(
+            body, constexpr_values=constexpr_values, rename_groups=renames
+        ),
     )
     return ast.fix_missing_locations(
         ast.Module(body=vectorizer.body(body), type_ignores=[])

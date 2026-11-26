@@ -21,10 +21,16 @@ mask ``index < extent`` and the bounds of its de-linearized coordinates
 then cost one compare per vector instead of one per lane: a Python
 remainder by a positive constant also has a known factor there (the gcd
 of its dividend's and the divisor), so the in-row bound ``r % d < d``
-compares the base's remainder.  The remainder gets it on its own, under
-integer casts or through a name bound to it, not inside a larger sum or
-product (``row * 192 + (r % 192)`` has no known factor).  Without the knob
-a remainder has factor 1, as before, and the code is the knob-off code.
+compares the base's remainder.  The remainder's factor carries through
+integer casts, names bound to it, and sums and products of integers
+(``row * 192 + (r % 192)`` has the gcd of 192 times ``row``'s factor and
+the remainder's), so a flat index rebuilt from a quotient and a remainder
+(an NCHW tensor's bound check ``c * HW + C * HW * (r // HW) + r % HW <
+numel``) compares its base too.  Without the knob a remainder alone keeps
+factor 1 and every comparison stays per lane, but a sum or product holding
+one is an integer expression all the same: ``k * (a % d)`` has the factor
+``k`` with or without it, so a quotient of a lane offset plus such a term
+divides its base either way (an integer identity, like every rewrite here).
 
 Facts are proved syntactically on the generated kernel body.  A name's known
 factor follows integer constants, constexpr values, sums (gcd), products and
@@ -738,6 +744,7 @@ class _Rewriter:
                     return visited
                 # The lane is a trace-time int, which keeps the remainder's type.
                 visited.args[0] = dividend
+                rewriter._rewrites += 1
                 return ast.BinOp(
                     left=visited, op=ast.Add(), right=ast.Name(id=lane, ctx=ast.Load())
                 )
@@ -830,6 +837,39 @@ def uniform_load_predicates(
     ``i``).  ``body`` is left as it was; only the loops with a statement the
     proof changed are returned.
     """
+    return _rewritten_copies(body, constexpr_values, rename_groups, load_predicate)
+
+
+def divided_vector_loops(
+    body: list[ast.stmt],
+    *,
+    constexpr_values: Mapping[str, int],
+    rename_groups: Mapping[str, str] | None = None,
+) -> dict[int, ast.For]:
+    """Copies of ``body``'s vector loops in which ``divide_vector_bases``
+    rewrote a lane quotient or remainder, by the ``id`` of the loop each
+    replaces.
+
+    For the affine vectorizer (``affine_vector_io``), which runs before
+    ``divide_vector_bases`` and needs each pointer's lane coefficient: an
+    NCHW tensor read through a flat tile over (n, h, w), at ``c * HW + (i //
+    HW) * C * HW + i % HW``, has its lane under the ``//`` and the ``%`` of
+    every lane's pointer, which the copy's ``base // HW`` and ``(base % HW)
+    + lane`` leave with coefficient one (``HW`` a multiple of the width).
+    ``body`` is left as it was; only the loops with a statement the proof
+    changed are returned.
+    """
+    return _rewritten_copies(body, constexpr_values, rename_groups, None)
+
+
+def _rewritten_copies(
+    body: list[ast.stmt],
+    constexpr_values: Mapping[str, int],
+    rename_groups: Mapping[str, str] | None,
+    load_predicate: Callable[[ast.IfExp], bool] | None,
+) -> dict[int, ast.For]:
+    """The vector loops of a copy of ``body`` that a rewriter with
+    ``load_predicate`` changed, by the ``id`` of the loop each replaces."""
     if not _supported_body(body):
         return {}
     copies = [deep_clone(statement) for statement in body]

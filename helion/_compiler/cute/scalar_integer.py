@@ -98,6 +98,18 @@ def _integer_expression(
         return isinstance(node.args[0], ast.Name) or _integer_expression(
             node.args[0], lane, known, integer_tensors=integer_tensors
         )
+    if (
+        isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "_cute_python_mod"
+        and len(node.args) == 2
+        and not node.keywords
+    ):
+        # The printer's integer remainder (``i % d`` of an index), integral
+        # like the ``%`` operator below.
+        return all(
+            _integer_expression(arg, lane, known, integer_tensors=integer_tensors)
+            for arg in node.args
+        )
     if isinstance(node, ast.UnaryOp) and isinstance(
         node.op, (ast.UAdd, ast.USub, ast.Invert)
     ):

@@ -243,6 +243,7 @@
  "test/test_cute_narrow_load_hints.py": 10.7,
  "test/test_cute_native_schedule_cuda.py": 34.4,
  "test/test_cute_native_warp_reductions.py": 5.5,
+ "test/test_cute_nchw_flat_vectors.py": 26.2,
  "test/test_cute_nested_reduction_scopes.py": 4.0,
  "test/test_cute_nested_row_seeds.py": 66.5,
  "test/test_cute_numeric_extrema.py": 0.9,
