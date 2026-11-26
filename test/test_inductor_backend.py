@@ -1018,7 +1018,7 @@ class TestInductorCute(InductorBackendTestCase):
         # over an rdim the autotuner can keep in registers, where Triton's loop
         # reads it twice (TestInductorBackend.test_long_softmax_rdim). A kernel
         # that only reduces the rdim, as cross-entropy's max and sum of exps,
-        # keeps the loop, which reads it once (rereads_softmax_rdim()).
+        # keeps the loop, which reads it once (rereads_rdim()).
         x = torch.randn(64, 4096, device=DEVICE)
         fn = lambda x: torch.softmax(x, -1)  # noqa: E731
         (source,) = self.compile(fn, x, tol=1e-4, backend="cute")
@@ -1035,6 +1035,84 @@ class TestInductorCute(InductorBackendTestCase):
             self.logsumexp_beside_logits, x, tol=1e-4, backend="cute"
         )
         self.assertIn("for tile_r in hl.tile(4096):", source)
+
+    def test_long_welford_rdim(self):
+        # A LayerNorm over rdims of 1536 reads each rdim as one block, up to
+        # PERSISTENT_WELFORD_RDIM: its mean, the squared deviations from it
+        # and the normalized values pass over an rdim the autotuner can keep in
+        # registers, where the Welford loop reads it twice. A var_mean that
+        # only reduces the rdim keeps the loop, which reads it once. A bf16
+        # input over an rdim of 1100 (no multiple of a block) is one block
+        # too.
+        x = torch.randn(64, 1536, device=DEVICE)
+        w, b = torch.randn(1536, device=DEVICE), torch.randn(1536, device=DEVICE)
+        fn = lambda x, w, b: F.layer_norm(x, [1536], w, b)  # noqa: E731
+        (source,) = self.compile(fn, x, w, b, tol=1e-4, backend="cute")
+        self.assertIn("tmp0 = in0[tile_x, :]", source)
+        self.assertNotIn("for tile_r", source)
+        fn = lambda x: torch.var_mean(x, -1)  # noqa: E731
+        (source,) = self.compile(fn, x, tol=1e-4, backend="cute")
+        self.assertIn("for tile_r in hl.tile(1536):", source)
+        x = torch.randn(512, 1100, device=DEVICE, dtype=torch.bfloat16)
+        fn = lambda x: F.layer_norm(x, [1100])  # noqa: E731
+        (source,) = self.compile(fn, x, tol=2e-2, backend="cute")
+        self.assertNotIn("for tile_r", source)
+        # Over rdims Triton's rule would loop over, the block keeps the loop's
+        # numerics (HelionKernel.welford()): an rdim of 3072 values of 0.7
+        # normalizes to 0, as in eager, where the deviations from a mean a
+        # spacing off made outputs of +-2.5e-5; 4096 values near 1e37, whose
+        # sum overflows, get a finite mean: outputs of 0 (a variance of inf),
+        # not nan; 1024 values of 100000000 then 1024 of 100000008, whose mean
+        # rounds to 100000000 even corrected, get eager's variance, 32 (the
+        # exact one is 16).
+        fn = lambda x: F.layer_norm(x, [x.shape[-1]])  # noqa: E731
+        x = torch.full((64, 3072), 0.7, device=DEVICE)
+        (source,) = self.compile(fn, x, tol=0, backend="cute")
+        # The mean and mean square of x * s, the deviations' sum, m2.
+        self.assertEqual(source.count("torch.sum("), 4)
+        self.assertEqual(self.result.count_nonzero().item(), 0)
+        x = torch.randn(64, 4096, device=DEVICE) * 1e37
+        (source,) = self.compile(fn, x, tol=0, backend="cute")
+        self.assertNotIn("for tile_r", source)
+        self.assertTrue(self.result.isfinite().all())
+
+        def var_and_normalized(x):
+            var, mean = torch.var_mean(x, -1, correction=0, keepdim=True)
+            return var, (x - mean) * torch.rsqrt(var + 1e-5)
+
+        x = torch.full((64, 2048), 1e8, device=DEVICE)
+        x[:, 1024:] = 100000008.0
+        self.compile(var_and_normalized, x, tol=1e-6, backend="cute")
+        # Constant rdims whose means round: 0.7 * 2**78, whose deviations' sum
+        # squared overflows; 0.55 * 2**78, which an fp32 division of their
+        # sum left a variance of 2.9e17; 0.55 * 2**100, whose squared
+        # deviations overflow (inf from sum(d * d) - sum(d) ** 2 / R); 0.55 *
+        # 2**74, whose sum of squares overflows where 2 * mean(x * s) ** 2
+        # does not (the squares' test at the means' scale took it the plain
+        # mean, a spacing off: a variance of 1.3e30 and outputs of +-1): the
+        # deviations from the corrected mean are 0 each, and so is the
+        # variance.
+        for value in (0.7 * 2**78, 0.55 * 2**78, 0.55 * 2**100, 0.55 * 2**74):
+            x = torch.full((64, 3072), value, device=DEVICE)
+            self.compile(var_and_normalized, x, tol=0, backend="cute")
+            self.assertEqual(self.result[0].count_nonzero().item(), 0)
+
+    def test_mix_order_welford_keeps_two_pass(self):
+        # A var_mean over r beside sums over x is one mix-order kernel, which
+        # Inductor makes persistent itself (override_persistent_reduction): it
+        # keeps Triton's persistent two-pass (HelionKernel.welford()), as an
+        # rdim of 2048 under Triton's rule would, and no corrected mean.
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        x = torch.randn(8192, 2048, device=DEVICE)
+        w = torch.randn(2048, device=DEVICE)
+
+        def fn(x, w):
+            var, mean = torch.var_mean(x, -1, correction=0)
+            return var, mean, x.sum(0), (x * w).sum(0)
+
+        (source,) = self.compile(fn, x, w, tol=1e-2, backend="cute")
+        self.assertRegex(source, r"for tile_y in hl.tile\(\d+\):")
+        self.assertNotIn("torch.isinf(", source)
 
     @staticmethod
     def logsumexp_beside_logits(x):

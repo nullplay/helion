@@ -70,33 +70,42 @@ LOOPED_REDUCTIONS = OrderedSet(
 
 # The longest rdim of an online-softmax reduction that the CuTe backend reads as
 # one block all the same, in a kernel that reads each rdim again after it
-# (rereads_softmax_rdim()): its max, its sum of exps and the rest each pass over
-# an rdim the autotuner can keep in registers (cute_reduction_reloads), or in a
+# (rereads_rdim()): its max, its sum of exps and the rest each pass over an rdim
+# the autotuner can keep in registers (cute_reduction_reloads), or in a
 # cluster's, where the loop reads it twice. Rdims of 262144 (a softmax over
 # [8192, 262144] bf16) are the longest measured faster so.
 PERSISTENT_SOFTMAX_RDIM = 2**18
+# The same for a Welford reduction, as a LayerNorm's var_mean before the pass
+# that normalizes each element: one block computes the mean, then the sum of
+# squared deviations from it and the normalized values, each over an rdim the
+# autotuner can keep in registers, where the loop reads the rdim twice (its
+# Welford pass, then the normalize pass). A LayerNorm with dropout over rdims
+# of 1536 ([4096, 1536] bf16, its RNG draws in the normalize pass) took half
+# the time of the loop (GB300).
+PERSISTENT_WELFORD_RDIM = 2**18
 
 
-def rereads_softmax_rdim(features: SIMDKernelFeatures) -> bool:
-    """Whether a kernel with an online softmax reads each rdim again after it:
-    another reduction over the rdim or a value of each element of it that
-    depends on the softmax's results, as the output of softmax(x, -1) or the
-    sum of it. Its loop then reads the rdim twice, where one block reads it
-    once; a kernel that only reduces the rdim, as cross-entropy's max and
-    log-sum-exp, reads it once either way, and one block of 262144 lanes is
-    slower than the loop for them. So does one that also writes a
-    value of each element the softmax's results do not reach, as the logits
-    y = x * 2 that a cross-entropy of y returns beside its loss: the loop
-    writes it in the pass that reduces the rdim."""
+def rereads_rdim(features: SIMDKernelFeatures, reduction_type: str) -> bool:
+    """Whether a kernel with a reduction of ``reduction_type`` (an online
+    softmax or a Welford reduction) reads each rdim again after it: another
+    reduction over the rdim or a value of each element of it that depends on
+    the reduction's results, as the output of softmax(x, -1) or the sum of it,
+    or a LayerNorm's normalized values. Its loop then reads the rdim twice,
+    where one block reads it once; a kernel that only reduces the rdim, as
+    cross-entropy's max and log-sum-exp, reads it once either way, and one
+    block of 262144 lanes is slower than the loop for them. So does one that
+    also writes a value of each element the reduction's results do not reach,
+    as the logits y = x * 2 that a cross-entropy of y returns beside its loss:
+    the loop writes it in the pass that reduces the rdim."""
     total = sympy.Mul(features.numel, features.reduction_numel)
     nodes = features.scheduler_nodes()
-    # The buffers the softmax's results reach, in kernel order: its own, then
+    # The buffers the reduction's results reach, in kernel order: its own, then
     # those of the nodes that read one of them.
     reached = OrderedSet(
         name
         for node in nodes
         if isinstance(node.node, ComputedBuffer)
-        and node.node.get_reduction_type() == "online_softmax_reduce"
+        and node.node.get_reduction_type() == reduction_type
         for name in node.get_buffer_names()
     )
     for node in nodes:
@@ -901,12 +910,12 @@ class HelionChoices(InductorChoices):
         test_split_reduction_loops); a chunk past UNROLLED_RDIM_MAX that no
         input's full rdim names loops anyway
         (HelionScheduling.create_kernel_choices()). With the CuTe backend, an
-        online-softmax rdim of up to PERSISTENT_SOFTMAX_RDIM is one block all
-        the same in a kernel that reads
-        each rdim again after it (rereads_softmax_rdim()), which the autotuner can
-        keep in registers across those passes; a kernel that only reduces the
-        rdim, as cross-entropy's, keeps the loop, which reads it once. Other
-        devices and backends keep Triton's rule, and
+        online-softmax rdim of up to PERSISTENT_SOFTMAX_RDIM, and a Welford rdim
+        of up to PERSISTENT_WELFORD_RDIM, is one block all the same in a kernel
+        that reads each rdim again after it (rereads_rdim()), which the
+        autotuner can keep in registers across those passes; a kernel that only
+        reduces the rdim, as cross-entropy's, keeps the loop, which reads it
+        once. Other devices and backends keep Triton's rule, and
         config.triton.persistent_reductions off still asks for loops. The kernel
         keeps an rdim it cannot write as one block in a loop, whatever this says
         (names_rdim()), and so does an rdim past UNROLLED_RDIM_MAX that no
@@ -923,14 +932,15 @@ class HelionChoices(InductorChoices):
             and not cooperative_reduction
         ):
             looped = LOOPED_REDUCTIONS
-            if (
-                config.backend == "cute"
-                and V.graph.sizevars.statically_known_leq(
-                    features.reduction_numel, PERSISTENT_SOFTMAX_RDIM
-                )
-                and rereads_softmax_rdim(features)
-            ):
-                looped = looped - OrderedSet(["online_softmax_reduce"])
+            if config.backend == "cute":
+                for reduction_type, longest in (
+                    ("online_softmax_reduce", PERSISTENT_SOFTMAX_RDIM),
+                    ("welford_reduce", PERSISTENT_WELFORD_RDIM),
+                ):
+                    if V.graph.sizevars.statically_known_leq(
+                        features.reduction_numel, longest
+                    ) and rereads_rdim(features, reduction_type):
+                        looped = looped - OrderedSet([reduction_type])
             if not any(
                 isinstance(node.node, ComputedBuffer)
                 and (
