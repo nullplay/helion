@@ -376,3 +376,16 @@ def masked_softmax_backward_rows(
         masked = row_mask.reshape([tile_z, 1, tile_x, rdim])  # pyrefly: ignore
         out[tile_z, tile_y, tile_x, :] = torch.where(masked, 0.0, dx).to(out.dtype)
     return out
+
+
+def row_norm_with_running_mean(x: torch.Tensor, stat: torch.Tensor) -> torch.Tensor:
+    """A row's mean-centred values, its mean also folded into ``stat`` in
+    place (a BatchNorm's running statistics): a buffer the kernel reads and
+    writes behind its reduction."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        row = x[tile, :].to(torch.float32)
+        mean = torch.mean(row, dim=-1)
+        out[tile, :] = (row - mean[:, None]).to(out.dtype)
+        stat[tile] = stat[tile] * 0.9 + mean * 0.1
+    return out
