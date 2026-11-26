@@ -948,15 +948,50 @@ _EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
     )
 )
 
+# Errors that leave the device context unusable: every later call in the
+# process returns the same error, so the benchmark worker must be replaced.
+# The CUDA ones are the faults a running kernel raises whose documentation
+# (driver_types.h) says "the process must be terminated and relaunched",
+# each in cudaGetErrorString's wording (torch's messages) and by its driver
+# enum name (cuda-python's: <CUresult.CUDA_ERROR_LAUNCH_FAILED: 719>).
 _UNRECOVERABLE_RUNTIME_ERROR_RE: re.Pattern[str] = re.compile(
     "|".join(
         map(
             re.escape,
             [
+                # 226
+                "Invalid access of peer GPU memory over nvlink or a hardware error",
+                "CUDA_ERROR_CONTAINED",
+                # 700
                 "illegal memory access",
-                "misaligned address",
-                "unspecified launch failure",
+                "CUDA_ERROR_ILLEGAL_ADDRESS",
+                # 702
+                "the launch timed out and was terminated",
+                "CUDA_ERROR_LAUNCH_TIMEOUT",
+                # 710
+                "device-side assert triggered",
+                "CUDA_ERROR_ASSERT",
+                # 714
+                "hardware stack error",
+                "CUDA_ERROR_HARDWARE_STACK_ERROR",
+                # 715
                 "illegal instruction",
+                "CUDA_ERROR_ILLEGAL_INSTRUCTION",
+                # 716
+                "misaligned address",
+                "CUDA_ERROR_MISALIGNED_ADDRESS",
+                # 717
+                "operation not supported on global/shared address space",
+                "CUDA_ERROR_INVALID_ADDRESS_SPACE",
+                # 718
+                "invalid program counter",
+                "CUDA_ERROR_INVALID_PC",
+                # 719
+                "unspecified launch failure",
+                "CUDA_ERROR_LAUNCH_FAILED",
+                # 721
+                "tensor memory not completely freed",
+                "CUDA_ERROR_TENSOR_MEMORY_LEAK",
                 "UR_RESULT_ERROR_DEVICE_LOST",
                 "ZE_RESULT_ERROR_DEVICE_LOST",
             ],
