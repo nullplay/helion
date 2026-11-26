@@ -4213,6 +4213,17 @@ class CuteSiblingRowHeuristic(AutotunerHeuristic):
         for threads in (256, 128, 512):
             if row_extent % (threads * vec) == 0 and row_extent // threads <= 64:
                 candidates.append((1, row_extent, threads))
+        # 1024 threads hold a row of 8192 bf16 elements (4096 float32) as one
+        # packet each. Fewer threads fold several packets per thread, which
+        # the CuTe backend refuses where the row's tail is masked ("cross-lane
+        # reduction fold"): a BatchNorm over 6144 elements per channel that
+        # updates its running statistics in place behind the reduction
+        # (better-benchmark's var_mean_0c1c9fc832f4_2a5a9625) renders only
+        # the three narrow seeds below, 11.9-35.4 us on GB300, and the 1024
+        # thread seed, 5.1 us (its best searched config: 5.0 us). Only that
+        # row, one packet per thread, takes it, after the seeds above.
+        if row_extent == 1024 * vec:
+            candidates.append((1, row_extent, 1024))
         if row_extent <= 2048 and row_extent % (32 * vec) == 0:
             candidates.append((4, row_extent, 32))
         wide_chunk = min(1024, high)
