@@ -864,7 +864,46 @@ def _replace_reduce_input(
     return new_stmt
 
 
-def _per_lane_reduce_escape(vloop: ast.For) -> str | None:
+# The name of a device loop's tile end in generated code (``tile_end = ...
+# if ... else end_0``, the end of a partial last tile), from which the
+# element count of the tile, ``tile_r.end - tile_r.begin``, is computed ahead
+# of a V-loop.
+_TILE_EXTENT_ROOT = re.compile(r"tile_end(_\d+)?")
+
+
+def _is_mask(value: ast.expr | None) -> bool:
+    """Whether ``value`` is a comparison or a boolean combination of them,
+    under single-argument casts (``cutlass.Boolean(i < tile_end)``)."""
+    while isinstance(value, ast.Call) and len(value.args) == 1 and not value.keywords:
+        value = value.args[0]
+    return isinstance(value, (ast.Compare, ast.BoolOp)) or (
+        isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.Not)
+    )
+
+
+def _reads_tile_extent(reads: set[str], known: set[str]) -> bool:
+    """Whether ``reads`` names a tile's end or a value in ``known``."""
+    return bool(reads & known) or any(
+        _TILE_EXTENT_ROOT.fullmatch(name) for name in reads
+    )
+
+
+def _note_tile_extent(stmt: ast.stmt, known: set[str]) -> None:
+    """Add to ``known`` the names ``stmt`` computes from a tile's end
+    (``_TILE_EXTENT_ROOT``) or from a name in ``known``: a count and the
+    values derived from it, not a mask (a comparison), which selects
+    elements rather than weighs them."""
+    if not isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        return
+    if _is_mask(stmt.value):
+        return
+    if _reads_tile_extent(names_read(stmt), known):
+        known |= names_written(stmt)
+
+
+def _per_lane_reduce_escape(
+    vloop: ast.For, extent_names: frozenset[str] = frozenset()
+) -> str | None:
     """Why a V-loop the hoist leaves in place computes the wrong values, or
     None.
 
@@ -878,8 +917,19 @@ def _per_lane_reduce_escape(vloop: ast.For) -> str | None:
     (``acc = acc + exp(v) + sum``) or keeping it past the loop keeps the
     partial where the program has the whole reduction.  Partials folded into
     a later reduce (Welford's centered squares) or into values the same in
-    every lane (Welford's chunk merge, online softmax's rescaled sums)
-    combine as the hoisted form would.
+    every lane (a Welford chunk merge over each lane's own count, online
+    softmax's rescaled sums) combine as the hoisted form would.  A partial
+    combined with the tile's extent (the tile's end, ``extent_names``: the
+    values computed ahead of the loop from it, its count first, and those
+    the loop computes from it without a lane's values or a partial) is read
+    as the tile's reduction: Inductor's looped Welford divides each lane's
+    sum by the tile's count,
+        v_26 = tmp36 / v_25       # v_25 = (tile_end - tile_offset_1) / B
+    and merges it with the tile's weight once per lane, so the mean is the
+    last lane's share of the sum over the whole count: at four V lanes of
+    1024 threads over a block of 4096, the mean of 3136 values of x + 1 came
+    out 0.2. (A chunk loop that also stores a value keeps its two reductions
+    in the V-loop, see _try_hoist_one_vloop().)
     """
     if not (
         isinstance(vloop.target, ast.Name) and vloop.target.id.startswith("vec_lane")
@@ -890,9 +940,20 @@ def _per_lane_reduce_escape(vloop: ast.For) -> str | None:
     lane_partials: dict[str, bool] = {}  # lane-varying partial -> read since
     carried: set[str] = set()  # names the body reads before writing
     written: set[str] = set()
+    # The extent values in view: those computed ahead of the loop that it
+    # has not redefined, and those it computes from a tile's end itself.  A
+    # count is one value in every lane and reads no reduction: a statement
+    # that reduces or reads a lane's values or a partial computes none.
+    extents_in_loop = set(extent_names)
     for stmt in vloop.body:
         reads = names_read(stmt)
         writes = names_written(stmt)
+        extents = {
+            name
+            for name in reads - partials
+            if name in extents_in_loop or _TILE_EXTENT_ROOT.fullmatch(name)
+        }
+        extents_in_loop -= writes
         carried |= reads - written
         written |= writes
         for name in reads & lane_partials.keys():
@@ -902,6 +963,17 @@ def _per_lane_reduce_escape(vloop: ast.For) -> str | None:
             and _find_warp_reduce_in_expr(node.value) is not None
             for node in ast.walk(stmt)
         )
+        if (
+            isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+            and not reduces
+            and not reads & (partials | lane_values)
+        ):
+            _note_tile_extent(stmt, extents_in_loop)
+        if not reduces and reads & partials and extents:
+            return (
+                "one V lane's partial is combined with the tile's extent "
+                f"({', '.join(sorted(extents))}), as if it were the tile's"
+            )
         from_partial = reduces or bool(reads & partials)
         if from_partial:
             partials |= writes
@@ -928,23 +1000,36 @@ def _hoist_in_body(
     running_sums: set[str],
     unfoldable_vec_lanes: set[str],
     input_dtypes: Mapping[str, str | None],
+    extent_names: frozenset[str] = frozenset(),
 ) -> list[ast.stmt]:
     """Walk ``body`` recursively; for each constexpr V-loop containing warp
     reductions, replace it with the V-fold + hoisted-reduce form.  A V-loop
     named in ``unfoldable_vec_lanes`` iterates another block than its
     reductions reduce (one output element per V lane) and is left alone.
+    ``extent_names`` are the names the statements around ``body`` compute
+    from a tile's extent ahead of it (``_note_tile_extent()``).
     """
 
-    def walk(stmts: list[ast.stmt]) -> list[ast.stmt]:
+    def walk(stmts: list[ast.stmt], extents: frozenset[str]) -> list[ast.stmt]:
         return _hoist_in_body(
-            stmts, acc_counter, running_sums, unfoldable_vec_lanes, input_dtypes
+            stmts,
+            acc_counter,
+            running_sums,
+            unfoldable_vec_lanes,
+            input_dtypes,
+            extents,
         )
 
     new_body: list[ast.stmt] = []
+    # The extent names in view: those of the enclosing lists, and those this
+    # list computes before the statement at hand.
+    known = set(extent_names)
     for stmt in body:
+        _note_tile_extent(stmt, known)
         if isinstance(stmt, ast.For):
-            stmt.body = walk(stmt.body)
-            stmt.orelse = walk(stmt.orelse)
+            before = frozenset(known)
+            stmt.body = walk(stmt.body, before)
+            stmt.orelse = walk(stmt.orelse, before)
             match = constexpr_v_loop(stmt)
             if match is not None and not (
                 isinstance(stmt.target, ast.Name)
@@ -957,18 +1042,18 @@ def _hoist_in_body(
                 if replacement is not None:
                     new_body.extend(replacement)
                     continue
-                reason = _per_lane_reduce_escape(vloop)
+                reason = _per_lane_reduce_escape(vloop, before)
                 if reason is not None:
                     raise exc.BackendUnsupported(
                         "cute", f"reduction left in a vector lane loop: {reason}"
                     )
             new_body.append(stmt)
         elif isinstance(stmt, ast.If):
-            stmt.body = walk(stmt.body)
-            stmt.orelse = walk(stmt.orelse)
+            stmt.body = walk(stmt.body, frozenset(known))
+            stmt.orelse = walk(stmt.orelse, frozenset(known))
             new_body.append(stmt)
         elif isinstance(stmt, (ast.With, ast.FunctionDef)):
-            stmt.body = walk(stmt.body)
+            stmt.body = walk(stmt.body, frozenset(known))
             new_body.append(stmt)
         else:
             new_body.append(stmt)
