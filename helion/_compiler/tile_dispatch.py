@@ -788,8 +788,14 @@ class TileStrategyDispatch:
         when it does not, when the reduction is narrower than its axis or
         would fold below it, when a reduction block is shared between roots
         (same-size full slices of several roots get one block id, which the
-        root ranges place in one root only, so the axes derived here would not
-        be the ones the other root's CTA runs), when roots share a registered
+        root ranges place in one root only) beside other reduction blocks of
+        any of them (its axis would then follow the reductions before it in
+        each root, and the axes derived here are those of one root only;
+        where it is the only one in each, it comes first in all of them, as
+        in a mean over each part of a cat emitted as one root per part, whose
+        threads a count against every root's tiles together, as the fallback
+        makes, would leave a lane loop summing the rdim serially in each
+        thread), when roots share a registered
         block size (their grids' block ids, which the ranges cannot tell
         apart), in a kernel of one root, and for layouts this does not model
         (a backend whose sections do not share axes, a collective layout
@@ -831,8 +837,18 @@ class TileStrategyDispatch:
         if index is None or any(low >= high for low, high in ranges):
             return None
         low, high = ranges[index]
+        # Same-size full slices of several roots are one block.  Where it is
+        # the only reduction block of every root using it, it comes first in
+        # each, so it takes the same axis of the shared launch in all of them.
+        alone = all(
+            self._root_reduction_block_ids[root] == {block_id}
+            for root in self._roots_using(block_id)
+        )
         if any(
-            not low < other < high or not self._roots_using(other) <= {index}
+            not low < other < high
+            or not (
+                self._roots_using(other) <= {index} or (other == block_id and alone)
+            )
             for other in {block_id, *self._root_reduction_block_ids[index]}
         ):
             return None
