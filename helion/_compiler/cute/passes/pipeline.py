@@ -1506,6 +1506,26 @@ def _hoist_exact_invariant_divisions(s: _DeviceBodyState) -> None:
     )
 
 
+def _issue_packets_first(s: _DeviceBodyState) -> None:
+    # Last of the structural passes: it inlines the one-trip tile loops whose
+    # lane loops share packets, so the passes that match tile loops ran.
+    from ..one_trip_packets import issue_packets_first
+
+    ctx = s.ctx
+    s.kernel_body = issue_packets_first(
+        s.kernel_body,
+        constexpr_values=ctx.constexpr_values,
+        tensor_names=ctx.tensor_arg_names,
+        proven_disjoint_tensor_pairs=ctx.proven_disjoint_tensor_pairs,
+        rename_groups=ctx.rename_groups,
+        thread_block_dims=ctx.exact_thread_block_dims,
+    )
+
+
+def _no_grid_lane_jam(s: _DeviceBodyState) -> bool:
+    return not s.ctx.config.get("cute_grid_lane_jam", False)
+
+
 def _jam_grid_lanes(s: _DeviceBodyState) -> None:
     # After every structural pass: the jam copies each lane's finished
     # statements, so the lanes compute exactly what the rolled loop did.
@@ -2066,6 +2086,13 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
         "jam_grid_lanes",
         _config_flag("cute_grid_lane_jam"),
         _jam_grid_lanes,
+        requires=("exact_divisions_hoisted", "carried_values_cut"),
+    ),
+    DeviceBodyPass(
+        "issue_packets_first",
+        # The lane jam copies each lane's statements; the two do not compose.
+        _no_grid_lane_jam,
+        _issue_packets_first,
         requires=("exact_divisions_hoisted", "carried_values_cut"),
     ),
 )
