@@ -6,10 +6,12 @@ op to Inductor's own), as it does wherever it declines."""
 
 from __future__ import annotations
 
+from .max_pool_gradient import register_max_pool_gradient_lowering
 from .reduction_order import register_reduction_order_lowerings
 from .transposed_pads import register_transposed_pads_lowering
 
 
 def register_lowerings() -> None:
+    register_max_pool_gradient_lowering()
     register_reduction_order_lowerings()
     register_transposed_pads_lowering()

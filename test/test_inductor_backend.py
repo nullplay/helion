@@ -4,6 +4,7 @@ import functools
 import gc
 import importlib
 import inspect
+import math
 import os
 import re
 import tempfile
@@ -958,6 +959,227 @@ def check_split_axis(test: InductorBackendTestCase, backend: str) -> None:
         test.assertNotIn("//", copy)
 
 
+def max_pool_offsets(x, kernel_size, stride, padding):
+    """The int8 offsets of a max pool's maxima within their windows, as
+    Inductor's low-memory max pool stores them: kh * kernel_size + kw."""
+    _, indices = F.max_pool2d(
+        x, kernel_size, stride, padding, ceil_mode=True, return_indices=True
+    )
+    width = x.shape[-1]
+    ph = torch.arange(indices.shape[-2], device=x.device).view(-1, 1)
+    pw = torch.arange(indices.shape[-1], device=x.device).view(1, -1)
+    kh = indices // width - (ph * stride - padding)
+    kw = indices % width - (pw * stride - padding)
+    return (kh * kernel_size + kw).to(torch.int8)
+
+
+def max_pool_gradient(
+    kernel_size, stride, padding, start=0.0, dtype=torch.float32, computed=False
+):
+    """max_pool2d_with_indices_backward as torch._decomp writes it, over the
+    offsets of Inductor's low-memory max pool, then the ReLU backward's where
+    and the bias gradient's sum (better-benchmark's sum_cf864ca94168). An
+    unbatched [C, H, W] mask takes the decomposition's unsqueezed form;
+    `computed` offsets are a value of the graph rather than its input."""
+
+    def fn(grad, offsets, mask):
+        if computed:
+            offsets = offsets.flip(-1).flip(-1)
+        *batch, c, h, w = mask.shape
+        b = batch[0] if batch else 1
+        ph, pw = grad.shape[-2:]
+        indices = torch.ops.prims._low_memory_max_pool_offsets_to_indices.default(
+            offsets,
+            [kernel_size] * 2,
+            [h, w],
+            [stride] * 2,
+            [padding] * 2,
+            [1, 1],
+        )
+        if not batch:
+            grad, indices = grad.unsqueeze(0), indices.unsqueeze(0)
+        full = torch.full((b * c, h * w), start, dtype=dtype, device=grad.device)
+        g = grad.contiguous().view(b * c, ph * pw).to(dtype)
+        index = indices.contiguous().view(b * c, ph * pw)
+        y = torch.scatter_add(full, 1, index, g).view(*batch, c, h, w)
+        y = y.to(grad.dtype) if dtype.is_floating_point else y.float()
+        y = torch.where(mask, torch.zeros((), dtype=y.dtype, device=y.device), y)
+        return y, y.sum([0, 2, 3] if batch else [1, 2]).float()
+
+    return fn
+
+
+# The max pools whose gradient check_max_pool_gradient() gathers, and those it
+# leaves to the scatter: kernel, stride, padding, input size, the full's fill,
+# the scatter's dtype.
+MAX_POOL_GATHERS = (
+    (2, 2, 0, (2, 16, 8, 8), 0.0, torch.float32),
+    (3, 3, 1, (2, 16, 10, 7), 0.0, torch.float32),
+    (2, 2, 0, (16, 8, 2), 0.0, torch.float32),
+    (2, 2, 0, (1, 16, 4, 4), 0.0, torch.float32),
+)
+MAX_POOL_SCATTERS = (
+    (3, 2, 1, (2, 16, 9, 7), 0.0, torch.float32),
+    (2, 2, 0, (2, 16, 8, 8), 1.0, torch.float32),
+    (2, 2, 0, (2, 16, 8, 8), -0.0, torch.float32),
+    (2, 2, 0, (2, 16, 8, 8), 0, torch.int64),
+)
+
+
+def check_max_pool_gradient(
+    test: InductorBackendTestCase, backend: str, cases: tuple = MAX_POOL_GATHERS
+) -> None:
+    """A max pool's gradient, scattered at its offsets' indices into zeros, is
+    a gather where its windows do not overlap
+    (helion.inductor.lowering.max_pool_gradient): no atomic add. Kernel 2
+    and stride 2 over a channels-last bf16 [2, 16, 8, 8] puts each input
+    position in one window, and the gather sits in the consumers' kernel,
+    beside the where and the sum over [0, 2, 3]; so does kernel 3, stride 3
+    and padding 1 over a non-square [2, 16, 10, 7]; an unbatched [16, 8, 2]
+    takes the decomposition's unsqueezed form; -0.0 gradients come out +0.0,
+    as from the scatter into +0.0. Overlapping windows (kernel 3,
+    stride 2), a scatter into ones, into -0.0 (whose untouched zeros keep
+    their sign) and of int64 values keep Inductor's scatter (cases
+    MAX_POOL_SCATTERS: a test of their own, as each case is a compile)."""
+    cl = torch.channels_last
+    for kernel_size, stride, padding, size, start, dtype in cases:
+        x = torch.randn(*size, device=DEVICE)
+        memory_format = cl if len(size) == 4 else torch.contiguous_format
+        x = x.to(memory_format=memory_format)
+        offsets = max_pool_offsets(x, kernel_size, stride, padding)
+        grad = torch.randn(offsets.shape, device=DEVICE, dtype=torch.bfloat16)
+        mask = torch.rand(*size, device=DEVICE) < 0.5
+        if not dtype.is_floating_point:
+            grad = torch.randint(-100, 100, offsets.shape, device=DEVICE)
+        elif len(size) == 3:
+            # Unbatched, of pooled width 1 and float32 (a graph input whose
+            # strides Inductor knows): a contiguous [16, 4, 1] has stride[1]
+            # 1, which Inductor's lowering reads as channels-last in 4-D.
+            grad = grad.float()
+        elif size[0] == 1:
+            # -0.0 gradients where the mask keeps them: +0.0, as the scatter
+            # added them into +0.0, not -0.0.
+            grad = torch.full(offsets.shape, -0.0, device=DEVICE)
+            mask = torch.zeros(*size, device=DEVICE, dtype=torch.bool)
+        fn = max_pool_gradient(kernel_size, stride, padding, start, dtype)
+        # The index is indirect: no device assert of it, which a Helion kernel
+        # cannot emit (Inductor's check_bounds), for the scatter and the gather.
+        with config.patch(assert_indirect_indexing=False):
+            sources = test.compile(
+                fn,
+                grad.to(memory_format=memory_format),
+                offsets.to(memory_format=memory_format),
+                mask.to(memory_format=memory_format),
+                tol=2e-2,
+                backend=backend,
+            )
+        code = "\n".join(sources)
+        negative_zero = math.copysign(1.0, start) < 0
+        overlapping = stride < kernel_size
+        if start != 0 or negative_zero or overlapping or not dtype.is_floating_point:
+            # The scatter stays: atomic adds, or for int64 an extern scatter.
+            test.assertTrue(
+                "hl.atomic_add(" in code or "aten.scatter_reduce_" in test.code
+            )
+            if negative_zero:
+                expected = fn(grad.float(), offsets, mask)[0]
+                test.assertEqual(test.result[0].signbit(), expected.signbit())
+            continue
+        test.assertNotIn("hl.atomic_add(", code)
+        # The gather compares each window's int8 offset, in int32, with the
+        # position's own offset in its window (window_gather()); the windows of
+        # 2 x 2 pools over even inputs need no clamp (torch.minimum), the
+        # padded kernel 3 / stride 3 pool's do.
+        (gather,) = [s for s in sources if "torch.int32" in s]
+        test.assertIn("torch.where(", gather)
+        test.assertIn("torch.sum(", gather)
+        test.assertEqual("torch.minimum(" in gather, padding > 0)
+        if size[0] == 1:
+            expected = fn(grad, offsets, mask)[0]
+            test.assertEqual(test.result[0].signbit(), expected.signbit())
+            test.assertFalse(test.result[0].signbit().any())
+
+
+def check_max_pool_gradient_computed_offsets(
+    test: InductorBackendTestCase, backend: str
+) -> None:
+    """Offsets that the graph computes, not its input: Inductor's own
+    max_pool2d_with_indices_backward lowering gathers over the decoded
+    indices, clamping each window index (helion.inductor.lowering.
+    max_pool_gradient reads only a graph input's offsets)."""
+    cl = torch.channels_last
+    x = torch.randn(2, 16, 8, 8, device=DEVICE).to(memory_format=cl)
+    offsets = max_pool_offsets(x, 2, 2, 0).to(memory_format=cl)
+    grad = torch.randn(offsets.shape, device=DEVICE, dtype=torch.bfloat16)
+    mask = (torch.rand(2, 16, 8, 8, device=DEVICE) < 0.5).to(memory_format=cl)
+    with config.patch(assert_indirect_indexing=False):
+        sources = test.compile(
+            max_pool_gradient(2, 2, 0, computed=True),
+            grad.to(memory_format=cl),
+            offsets,
+            mask,
+            tol=2e-2,
+            backend=backend,
+        )
+    code = "\n".join(sources)
+    test.assertNotIn("hl.atomic_add(", code)
+    test.assertIn("torch.minimum(", code)
+
+
+def check_max_pool_gradient_written_indices(
+    test: InductorBackendTestCase, backend: str
+) -> None:
+    """A max pool's decoded indices written in place before the full and the
+    scatter_add: a user Triton kernel swaps each pair of windows' indices,
+    which Inductor's reinplacing points at the indices' buffer. The scatter
+    then adds each window's gradient at its neighbor's max, where the gather
+    looks for an input position in its own window alone: the scatter stays,
+    and the result is eager's. (Triton is imported here: the lanes without
+    it, Metal's and TPU's, collect this module too.)"""
+    if backend == "cute" and not _has_cute_dsl():
+        test.skipTest("requires CuTeDSL")
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def swap_index_pairs(ptr, n, BLOCK: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        values = tl.load(ptr + (offsets ^ 1), mask=offsets < n)
+        tl.debug_barrier()
+        tl.store(ptr + offsets, values, mask=offsets < n)
+
+    cl = torch.channels_last
+    x = torch.randn(2, 16, 8, 8, device=DEVICE).to(memory_format=cl)
+    offsets = max_pool_offsets(x, 2, 2, 0).to(memory_format=cl)
+    grad = torch.randn(offsets.shape, device=DEVICE).to(memory_format=cl)
+    mask = (torch.rand(2, 16, 8, 8, device=DEVICE) < 0.5).to(memory_format=cl)
+
+    def fn(grad, offsets, mask):
+        b, c, h, w = mask.shape
+        indices = torch.ops.prims._low_memory_max_pool_offsets_to_indices.default(
+            offsets, [2, 2], [h, w], [2, 2], [0, 0], [1, 1]
+        )
+        index = indices.contiguous().view(b * c, -1)
+        swap_index_pairs[(triton.cdiv(index.numel(), 64),)](
+            index, index.numel(), BLOCK=64
+        )
+        full = torch.full((b * c, h * w), 0.0, device=grad.device)
+        y = torch.scatter_add(full, 1, index, grad.contiguous().view(b * c, -1))
+        y = torch.where(mask, 0.0, y.view(b, c, h, w))
+        return y, y.sum([0, 2, 3])
+
+    expected = fn(grad, offsets, mask)
+    with (
+        helion_config.patch(backend=backend),
+        config.patch(assert_indirect_indexing=False),
+    ):
+        result, codes = run_and_get_code(
+            torch.compile(fn, fullgraph=True), grad, offsets, mask
+        )
+    test.assertEqual(result, expected, atol=1e-4, rtol=1e-4)
+    test.assertIn("hl.atomic_add(", "\n".join(codes))
+
+
 # The CuTe lane, where CuTe DSL is installed, runs this.
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
@@ -1360,6 +1582,18 @@ class TestInductorCute(InductorBackendTestCase):
 
     def test_unequal_cat_segment_loops(self):
         check_unequal_cat_segment_loops(self, "cute")
+
+    def test_max_pool_gradient(self):
+        check_max_pool_gradient(self, "cute")
+
+    def test_max_pool_gradient_declines(self):
+        check_max_pool_gradient(self, "cute", MAX_POOL_SCATTERS)
+
+    def test_max_pool_gradient_written_indices(self):
+        check_max_pool_gradient_written_indices(self, "cute")
+
+    def test_max_pool_gradient_computed_offsets(self):
+        check_max_pool_gradient_computed_offsets(self, "cute")
 
     def test_batch_norm_unrolls_runs(self):
         # A training BatchNorm over an NCHW [4, 32, 14, 14] bf16, its running
@@ -3862,6 +4096,18 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
 
     def test_unequal_cat_segment_loops(self):
         check_unequal_cat_segment_loops(self, "triton")
+
+    def test_max_pool_gradient(self):
+        check_max_pool_gradient(self, "triton")
+
+    def test_max_pool_gradient_declines(self):
+        check_max_pool_gradient(self, "triton", MAX_POOL_SCATTERS)
+
+    def test_max_pool_gradient_written_indices(self):
+        check_max_pool_gradient_written_indices(self, "triton")
+
+    def test_max_pool_gradient_computed_offsets(self):
+        check_max_pool_gradient_computed_offsets(self, "triton")
 
     def test_window_spans(self):
         check_window_spans(self, "triton")

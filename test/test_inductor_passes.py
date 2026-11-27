@@ -31,6 +31,14 @@ from helion.inductor.fx_passes import post_grad
 from helion.inductor.fx_passes.cat_reductions import pointwise
 from helion.inductor.fx_passes.cat_reductions import split_cat_reductions
 from helion.inductor.fx_passes.post_grad import HelionPostGradPass
+from helion.inductor.lowering.max_pool_gradient import SCATTER_ADD
+from helion.inductor.lowering.max_pool_gradient import max_pool_gradient
+from helion.inductor.lowering.max_pool_gradient import pool_of
+from helion.inductor.lowering.max_pool_gradient import positive_zero
+from helion.inductor.lowering.max_pool_gradient import (
+    register_max_pool_gradient_lowering,
+)
+from helion.inductor.lowering.max_pool_gradient import window_count
 from helion.inductor.lowering.reduction_order import REDUCTIONS
 from helion.inductor.lowering.reduction_order import memory_order_permutation
 from helion.inductor.lowering.reduction_order import register_reduction_order_lowerings
@@ -156,6 +164,69 @@ class TestReductionOrder(TestCase):
         register_reduction_order_lowerings()
         after = {op: inductor_lowering.user_lowerings.get(op) for op in REDUCTIONS}
         self.assertEqual(after, before)
+
+
+class TestMaxPoolGradient(TestCase):
+    def test_window_count(self):
+        # The most windows one input position lies in: one where they do not
+        # overlap (kernel 2 and stride 2, kernel 3 and stride 3), two per dim
+        # for kernel 3 and stride 2 (four in 2-D), and kernel per dim at
+        # stride 1.
+        self.assertEqual(window_count([2, 2], [2, 2]), 1)
+        self.assertEqual(window_count([3, 3], [2, 2]), 4)
+        self.assertEqual(window_count([3, 3], [3, 3]), 1)
+        self.assertEqual(window_count([3, 2], [1, 2]), 3)
+        self.assertEqual(window_count([7, 7], [1, 1]), 49)
+
+    def test_pool_of(self):
+        # The offsets-to-indices node behind the scatter_add's index, through a
+        # contiguous clone, views and the unbatched form's unsqueeze; None for
+        # an index of any other source.
+        def fn(offsets, unbatched, src):
+            to_indices = torch.ops.prims._low_memory_max_pool_offsets_to_indices.default
+            indices = to_indices(offsets, [2, 2], [8, 8], [2, 2], [0, 0], [1, 1])
+            index = indices.contiguous().view(32, 16)
+            indices = to_indices(unbatched, [2, 2], [8, 8], [2, 2], [0, 0], [1, 1])
+            unsqueezed = indices.unsqueeze(0).contiguous().view(16, 16)
+            full = torch.zeros(32, 64)
+            return (
+                torch.scatter_add(full, 1, index, src),
+                torch.scatter_add(full[:16], 1, unsqueezed, src[:16]),
+                torch.scatter_add(full, 1, index % 7, src),
+            )
+
+        offsets = torch.randint(0, 4, (2, 16, 4, 4), dtype=torch.int8)
+        unbatched = torch.randint(0, 4, (16, 4, 4), dtype=torch.int8)
+        gm = make_fx(fn)(offsets, unbatched, torch.randn(32, 16))
+        pooled, unsqueezed, other = [
+            n for n in gm.graph.nodes if n.target is SCATTER_ADD
+        ]
+        pool = pool_of(pooled.args[2])
+        self.assertIsNotNone(pool)
+        self.assertEqual(pool.args[1:], ([2, 2], [8, 8], [2, 2], [0, 0], [1, 1]))
+        self.assertIsNotNone(pool_of(unsqueezed.args[2]))
+        self.assertIsNone(pool_of(other.args[2]))
+
+    def test_positive_zero(self):
+        # The fills the gather may drop: 0 and +0.0. A -0.0 keeps its sign
+        # where no window adds, and False is no int fill.
+        self.assertTrue(positive_zero(0))
+        self.assertTrue(positive_zero(0.0))
+        self.assertFalse(positive_zero(-0.0))
+        self.assertFalse(positive_zero(False))
+        self.assertFalse(positive_zero(1.0))
+
+    def test_inert_without_the_helion_backend(self):
+        # Other backends' compiles (stock Inductor beside helion.inductor in
+        # one process) never reach the gather: it declines before it looks at
+        # the graph.
+        with config.patch(cuda_backend="triton"):
+            self.assertIsNone(max_pool_gradient(None, 1, None, None))
+
+    def test_registering_again_keeps_one_wrapper(self):
+        before = inductor_lowering.user_lowerings.get(SCATTER_ADD)
+        register_max_pool_gradient_lowering()
+        self.assertIs(inductor_lowering.user_lowerings.get(SCATTER_ADD), before)
 
 
 class TestCatReductions(TestCase):
