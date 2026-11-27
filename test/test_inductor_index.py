@@ -579,6 +579,59 @@ class TestAxisSplit(TestCase):
         self.assertEqual(self.split(sizes, whole)[0], ("y", 256))
 
 
+class TestSegmentLoopView(TestCase):
+    """HelionKernel.flat_subscript() in a segment's loop of its own
+    (segment_axis() with loops): the flat view starts at the index's positive
+    constant term only where it holds every element the rest of the index
+    reaches."""
+
+    def view(self, index, size):
+        """The offset of the view, of a storage of `size` elements, that
+        flat_subscript() reads at `index` in the loop of the second segment
+        of x, cut at 64 of 160 in a [4, 160] kernel over an rdim of 2048, and
+        the subscript."""
+        graph = GraphLowering(torch.fx.symbolic_trace(lambda x: x + 1))
+        with V.set_graph_handler(graph):
+            sizes = {"y": 4, "x": 160, "r0_": 2048}
+            kernel = HelionKernel(
+                sizes,
+                features=SIMDKernelFeatures(
+                    [], sympy.Integer(4 * 160), sympy.Integer(2048)
+                ),
+                override_persistent_reduction=False,
+            )
+            buffer = InputBuffer(
+                name="arg0_1",
+                layout=FixedLayout(torch.device("cuda"), torch.float32, [size], [1]),
+            )
+            kernel.segment_axis("x", [(0, 64), (64, 160)], loops=True)
+            with V.set_kernel_handler(kernel), kernel.pointwise_segment(64, 160):
+                arg, coordinates, _ = kernel.flat_subscript(
+                    buffer, index(**kernel.symbols), list(sizes)
+                )
+        return arg.operand.get_layout().offset, coordinates[0]
+
+    def test_view_from_the_segment_start(self):
+        # The second segment's part of a [4, 160, 2048] storage, 64 x of 2048
+        # elements in: 131072 + 2048*x + ... reads a view at 131072.
+        part = lambda y, x, r0_: 131072 + 2048 * x + 327680 * y + r0_  # noqa: E731
+        offset, subscript = self.view(part, 4 * 160 * 2048)
+        self.assertEqual(offset, 131072)
+        self.assertNotIn("131072", subscript)
+        # A storage of a symbolic size (a dynamic dim) is not known to hold
+        # 131072 elements, where comparing them crashed: the whole storage.
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        offset, subscript = self.view(part, s0)
+        self.assertEqual(offset, 0)
+        self.assertIn("131072", subscript)
+        # Nor a storage that ends at the constant: another part's load, whose
+        # mask the segment proves false.
+        self.assertEqual(self.view(part, 64 * 2048)[0], 0)
+        # A flip along x reads below its constant: 194560 - 2048*x reaches 0.
+        flip = lambda y, x, r0_: 194560 - 2048 * x + 327680 * y + r0_  # noqa: E731
+        self.assertEqual(self.view(flip, 4 * 160 * 2048)[0], 0)
+
+
 class TestPersistentLoad(TestCase):
     def test_masked_load_through_layout(self):
         # In a persistent reduction a masked load through its buffer's own

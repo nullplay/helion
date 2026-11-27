@@ -399,6 +399,13 @@ RDIM_SEGMENT_MIN = 16
 # (HelionKernel.span_subscript()) must start on: the width of the widest packet
 # a lane loads.
 SPAN_ALIGNMENT = 16
+# The most segments of a pointwise axis a reduction kernel emits as top-level
+# loops of their own (HelionKernel.codegen_segment_loops()): DenseNet's cats of a
+# block's inputs along channels, 64 + 5 * 32 channels before a BatchNorm,
+# make 6. Each loop is a case of the kernel's one launch (Helion's
+# ForEachProgramID), whose dispatch tests the program id against every
+# earlier case's grid.
+SEGMENT_LOOPS_MAX = 8
 
 
 def as_less(relation: sympy.Rel) -> tuple[sympy.Basic, sympy.Basic, bool]:
@@ -545,6 +552,11 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.split: tuple[str, int] | None = None
         self.axis_segments: tuple[str, list[tuple[int, int]]] | None = None
         self.axis_segment: tuple[str, int] | None = None
+        # Whether each segment is a top-level loop of its own, and the bodies
+        # of the loops emitted so far with their segments' [start, end); see
+        # codegen_segment_loops() and end_segment_loop().
+        self.segment_loops = False
+        self.segment_bodies: list[tuple[int, int, IndentedBuffer]] = []
 
     def __enter__(self) -> Self:
         if self.mix_order_reduction and "y" not in self.symbols:
@@ -1412,8 +1424,9 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         eviction policy, which its packets of a span's view do not take: a
         reduction over a cat of [36, 1536] parts read 8.5% slower so), as does
         a looped rdim, and so does a load that a mask turns off on every lane
-        (load() passes `spans` off)."""
-        if self.rolled:
+        (load() passes `spans` off), and a segment's loop of its own, whose flat
+        view starts at its part (flat_subscript())."""
+        if self.rolled or (self.segment_loops and self.axis_segment is not None):
             return None
         scope = [axis for axis in self.axes if axis in axes]
         if len(scope) < 2 or self.indirect_vars(index):
@@ -1539,10 +1552,43 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         *,
         output: bool = False,
     ) -> tuple[HelionTensorArg, list[str], TileShape]:
-        """A flat view of the storage read at `index`, like a Triton pointer offset."""
+        """A flat view of the storage read at `index`, like a Triton pointer offset.
+
+        In a segment's loop of its own (segment_axis() with loops), the view
+        starts at the index's positive constant term, the segment's start
+        along the axis times its stride. A buffer that one segment's loop
+        writes, read or written again flat through its whole storage in a
+        later loop, fails Helion's check of the loops' order
+        ("LoopDependencyError: 'out0' was written in a previous loop"),
+        although the segments' parts of the axis are disjoint and none reads
+        another's writes. The second segment's out0[c + 784*tile_x.index +
+        ...], c its start times the axis's stride, is out0[784*tile_x.index +
+        ...] of a view at c, a parameter of its own."""
         self.note_axis_divisors(index)
         size = buffer.get_layout().storage_size()
-        operand = self.view(buffer, [size], [sympy.S.One], sympy.S.Zero)
+        offset = sympy.S.Zero
+        if self.segment_loops and self.axis_segment is not None:
+            # The view starts at the constant only where it holds every
+            # element the rest of the index reaches: the constant below the
+            # storage size, which may be symbolic (x[0] of a dynamic x [s0,
+            # 40, 72], as in affine_view()), and the rest never negative over
+            # the tiles' ranges, which a flip's 159 - tile_x.index is not.
+            # Another part's load in this segment, whose constant lies past
+            # its storage (the cat's mask, proven false, drops it), keeps the
+            # whole storage too.
+            constant, rest = index.as_coeff_Add()
+            sizevars = V.graph.sizevars
+            if (
+                isinstance(constant, sympy.Integer)
+                and constant > 0
+                and sizevars.statically_known_lt(constant, size)
+                and sizevars.statically_known_geq(
+                    bound_sympy(rest, self.value_ranges(axes)).lower, 0
+                )
+            ):
+                offset = constant
+                index = rest
+        operand = self.view(buffer, [size - offset], [sympy.S.One], offset)
         arg = self.tensor_arg(operand, output=output)
         return (
             arg,
@@ -1644,6 +1690,8 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         with code.indent():
             if self.mix_order_reduction:
                 self.codegen_split_x(code)
+            elif self.segment_bodies:
+                self.codegen_segment_loops(code)
             else:
                 tiles = ", ".join(TILE_NAMES[axis] for axis in self.outer_axes)
                 sizes = ", ".join(str(self.extents[axis]) for axis in self.outer_axes)
@@ -1663,6 +1711,43 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                     self.codegen_rdim(code, TILE_NAMES[self.outer_axes[-1]])
                     code.splice(self.body)
         return re.sub(r"__arg\d+__", lambda ref: names[ref[0]], code.getvalue())
+
+    def codegen_segment_loops(self, code: IndentedBuffer) -> None:
+        """One top-level loop per segment of the segmented axis
+        (segment_axis() with loops), over that segment's extent, with the body
+        end_segment_loop() kept for it. Helion launches them as one kernel
+        whose program ids run the first loop's tiles, then the next one's. For
+        the partial statistics of DenseNet's BatchNorm over a cat of 64 + 5 *
+        32 channels, per image over its 3136 pixels:
+            for tile_y, tile_x in hl.tile([4, 64]):
+                acc = hl.zeros([tile_y, tile_x], dtype=torch.float32)
+                ...
+                for tile_r in hl.tile(3136):
+                    tmp5 = in0[tile_y, tile_x, tile_r].to(torch.float32)
+                    ...
+                out1[tile_y, tile_x] = acc
+                ...
+            for tile_y, tile_x in hl.tile([4, 32]):
+                acc3 = hl.zeros([tile_y, tile_x], dtype=torch.float32)
+                ...
+                for tile_r in hl.tile(3136):
+                    tmp69 = in7[tile_y, tile_x, tile_r].to(torch.float32)
+                    ...
+        and four more loops over [4, 32], where one loop over [4, 224] loaded
+        all six parts for each element behind their masks and selected one."""
+        assert self.axis_segments is not None
+        segmented = self.axis_segments[0]
+        tiles = ", ".join(TILE_NAMES[axis] for axis in self.outer_axes)
+        for start, end, body in self.segment_bodies:
+            sizes = ", ".join(
+                str(end - start) if axis == segmented else str(self.extents[axis])
+                for axis in self.outer_axes
+            )
+            sizes = sizes if len(self.outer_axes) == 1 else f"[{sizes}]"
+            code.writeline(f"for {tiles} in hl.tile({sizes}):")
+            with code.indent():
+                self.codegen_rdim(code, TILE_NAMES[self.outer_axes[-1]])
+                code.splice(body)
 
     def codegen_rdim(self, code: IndentedBuffer, tile: str) -> None:
         """Define rdim (rdim_code()): for an rdim of more than UNROLLED_RDIM_MAX
@@ -2138,17 +2223,40 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         if isinstance(extent, (int, sympy.Integer)) and 0 < cut < int(extent):
             self.axis_cuts.setdefault(axis, OrderedSet()).add(cut)
 
-    def pointwise_segments(self) -> tuple[str, list[tuple[int, int]]] | None:
-        """The pointwise axis and the equal segments of it to emit the whole
-        body over (pointwise_segment()), when the cuts of one axis
-        (note_axis_cut()) make 2 to RDIM_SEGMENTS_MAX segments of one length,
-        at least RDIM_SEGMENT_MIN:
-        the parts of cat([x, relu(bn(y))], 1) of two [512, 60, 28, 28]
-        channels-last parts, cut at 60 of 120 channels. None for cuts on
-        several axes, unequal segments (a pad's 355 and 23567 of 23923), and
-        for a kernel that loops over tile_r, whose loop the body's emissions
-        would share."""
-        if self.rolled_reduction() or len(self.axis_cuts) != 1:
+    def pointwise_segments(self) -> tuple[str, list[tuple[int, int]], bool] | None:
+        """The pointwise axis, the segments of it to emit the whole body over
+        (pointwise_segment()) and whether each segment is a loop of its own,
+        when the cuts of one axis (note_axis_cut()) make:
+        - 2 to RDIM_SEGMENTS_MAX segments of one length, at least
+          RDIM_SEGMENT_MIN, in a kernel that does not loop over tile_r: one
+          loop whose tile spans a segment and whose body is emitted once for
+          each, the parts of cat([x, relu(bn(y))], 1) of two [512, 60, 28, 28]
+          channels-last parts, cut at 60 of 120 channels;
+        - else 2 to SEGMENT_LOOPS_MAX segments of a reduction that loops over
+          tile_r, over rdims that are runs of memory (not
+          reads_strided_rdim()) and that no index divides or takes modulo
+          (note_axis_divisors()): one top-level loop per segment, over that
+          segment's extent (codegen_segment_loops()). The partial statistics
+          of DenseNet's BatchNorm over a cat of 64 + 5 * 32 channels, per
+          image over its 3136 pixels, read each part in its own loop as a
+          view, in packets, where one loop loads all six parts for each
+          element behind masks and selects one: 4.35 us against 8.05
+          (GB300, each at its best known config). A BatchNorm of 128 + 5 *
+          32 channels over 4 images of 784 pixels, its statistics and its
+          normalize in one kernel, reads its rdim through r // 784 and r %
+          784; its parts stay flat in loops of their own, and one loop's
+          masked loads ran faster (6.69 against 8.28 us). A persistent rdim
+          keeps one loop: each part's rdims are spans of its parameter
+          (span_subscript()), and one root gets the autotuner's seeds of a
+          reduction, which a kernel of several roots does not: ViT's
+          LayerNorm of cat([cls, patches], 1), cut at 1 of 197 along x, took
+          14.5 to 14.9 us in one loop (two searches), and 16.0 to 26.0 us in
+          two (three searches).
+        None for cuts on several axes, and for the unequal segments of a
+        pointwise kernel or of an outer reduction (a pad's 355 and 23567 of
+        23923 along a dim of unit stride), whose short segments would be
+        strided runs of their tensors."""
+        if len(self.axis_cuts) != 1:
             return None
         ((axis, cuts),) = self.axis_cuts.items()
         extent = self.extents[axis]
@@ -2158,28 +2266,67 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         segments = list(itertools.pairwise(points))
         lengths = {hi - lo for lo, hi in segments}
         if (
-            not 2 <= len(segments) <= RDIM_SEGMENTS_MAX
-            or len(lengths) != 1
-            or min(lengths) < RDIM_SEGMENT_MIN
+            not self.rolled_reduction()
+            and 2 <= len(segments) <= RDIM_SEGMENTS_MAX
+            and len(lengths) == 1
+            and min(lengths) >= RDIM_SEGMENT_MIN
         ):
-            return None
-        return axis, segments
+            return axis, segments, False
+        if (
+            self.rolled_reduction()
+            and not self.mix_order_reduction
+            and self.runs is None
+            and not self.reads_strided_rdim(self.features)
+            and "r0_" not in self.axis_divisors
+            and 2 <= len(segments) <= SEGMENT_LOOPS_MAX
+        ):
+            return axis, segments, True
+        return None
 
     def rolled_reduction(self) -> bool:
         """Whether the kernel reduces in a loop over tile_r (not persistent)."""
         return self.features.is_reduction() and not self.persistent_reduction
 
-    def segment_axis(self, axis: str, segments: list[tuple[int, int]]) -> None:
-        """Emit the kernel over the equal `segments` of pointwise `axis`
-        (pointwise_segments()): its tile spans one segment, and the body is
-        emitted once for each (pointwise_segment())."""
-        length = segments[0][1] - segments[0][0]
+    def segment_axis(
+        self, axis: str, segments: list[tuple[int, int]], loops: bool = False
+    ) -> None:
+        """Emit the kernel over the `segments` of pointwise `axis`
+        (pointwise_segments()): equal ones in one loop whose tile spans one
+        segment, with the body emitted once for each (pointwise_segment()),
+        or, with `loops`, each segment in a top-level loop of its own over
+        its extent (codegen_segment_loops())."""
         self.axis_segments = (axis, segments)
+        self.segment_loops = loops
+        if loops:
+            # Each segment's emission sets its own extent (pointwise_segment()).
+            return
+        length = segments[0][1] - segments[0][0]
         self.extents[axis] = sympy.Integer(length)
         self.tile_ranges[self.symbols[axis]] = sympy.Integer(length)
 
+    def end_segment_loop(self, start: int, end: int) -> None:
+        """Close the top-level loop of the segment [start, end) of the
+        segmented axis (codegen_segment_loops()): flush its body, keep it for
+        codegen_kernel(), and start the next segment's loop from a fresh CSE,
+        as no value of one loop is defined in the next."""
+        self.codegen_body()
+        self.segment_bodies.append((start, end, self.body))
+        self.body = IndentedBuffer()
+        # CSE.invalidate() is the way to drop the cached values; the stores it
+        # marks invalidated would keep every buffer the next loop reads back
+        # (must_keep_buffers): the welford's mean of a LayerNorm, which its
+        # normalize reads, would be stored to memory. The next loop stores its
+        # own part of each before it reads it, as the first did
+        # (HelionScheduling._codegen_node_schedule_body()).
+        invalidated = OrderedSet(self.cse.invalidated_stores)
+        self.cse.invalidate(OrderedSet())
+        self.cse.invalidated_stores = invalidated
+        self.cse.reduction_cache.clear()
+        self.outer_vars.clear()
+        self.outer_stores.clear()
+
     @contextlib.contextmanager
-    def pointwise_segment(self, start: int) -> Iterator[None]:
+    def pointwise_segment(self, start: int, end: int | None = None) -> Iterator[None]:
         """Emit within the segment of the segmented axis (segment_axis()) that
         starts at `start`: its tile counts from `start` (tile_index()), so that
         the comparisons of a cat's mask are proven (proven()) and its parts are
@@ -2198,15 +2345,24 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                 ...
                 tmp11 = in1[tile_y, :, tile_x].to(torch.float32)
                 ...
-                out2[tile_y, :, tile_x] = tmp21.to(torch.bfloat16)"""
+                out2[tile_y, :, tile_x] = tmp21.to(torch.bfloat16)
+        A segment in a loop of its own (codegen_segment_loops()) tiles its own extent,
+        `end` - `start`, while it is emitted."""
         assert self.axis_segments is not None
         axis = self.axis_segments[0]
         saved = self.axis_segment
+        symbol = self.symbols[axis]
+        saved_extent = self.extents[axis], self.tile_ranges[symbol]
         self.axis_segment = (axis, start)
+        if self.segment_loops:
+            assert end is not None
+            self.extents[axis] = sympy.Integer(end - start)
+            self.tile_ranges[symbol] = sympy.Integer(end - start)
         try:
             yield
         finally:
             self.axis_segment = saved
+            self.extents[axis], self.tile_ranges[symbol] = saved_extent
 
     def rdim_cut_segments(self, names: Iterable[str]) -> list[tuple[int, int]] | None:
         """The segments the cuts of the nodes `names` (note_rdim_cut()) make of
