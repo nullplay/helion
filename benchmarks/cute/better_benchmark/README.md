@@ -577,8 +577,9 @@ all, and two things move a sample of a small kernel by more than the 1% a
 comparison near parity is about:
 
 - Inductor's pick. A bench has a cache directory of its own, so coordinate
-  descent tunes `inductor_cd` and `inductor_max` (the options of
-  `mode="max-autotune"`, which include it) again in every process, and it
+  descent tunes `inductor_cd`, `inductor_cdmk` and `inductor_max` (the
+  options of `mode="max-autotune"`, which include it) again in every
+  process, and it
   does not end on the same config every time. Over eight processes of
   var_mean_c3ea8f7ce5c6 `inductor_cd` ended on `XBLOCK=1` with one warp,
   `XBLOCK=1` with two and `XBLOCK=2` with one, and read 10.5 to 11.1 us; the
@@ -586,9 +587,12 @@ comparison near parity is about:
   process (`RSPLIT_SIZE` 8, 16, 32 or 64), which moved those points'
   baselines by 8 to 21%. A bench record names the config that each Triton
   kernel of every Inductor compile (`inductor`, `inductor_cd`,
-  `inductor_max`) ended on (`inductor_configs`: block sizes, warps, stages,
-  a mix-order kernel's split size, registers), read from the kernels the
-  compiled code launches, and `report.py` lists them.
+  `inductor_cdmk`, `inductor_max`) ended on (`inductor_configs`: block
+  sizes, warps, stages, a mix-order kernel's split size, registers), read
+  from the kernels the compiled code launches, and `report.py` lists them.
+  `inductor_cdmk`'s multi-kernels pick their persistent or looped
+  reduction in each process too, at the warm-up call ahead of the capture;
+  its records list each pick (`multi_kernel_picks`).
 - Placement. A small kernel's reading depends on where its buffers lie in
   device memory. One CuTe config of that point read 11.05 to 12.07 us on six
   input sets of the same values in one process, timed in rotation, and
@@ -880,7 +884,7 @@ S=benchmarks/cute/better_benchmark
 scripts/gpu_board.py run --gpus $G --purpose "better-benchmark BASELINE" -- \
     python $S/campaign.py --selection $S/selection.json --run-dir RUN-BASELINE \
     --backends cute --configs-from RUN/configs --phases bench --bench-repeats 3 \
-    --bench-impls inductor,inductor_cd,inductor_max,oracle,helion_cute,memcopy \
+    --bench-impls inductor,inductor_cd,inductor_cdmk,inductor_max,oracle,helion_cute,memcopy \
     --gpus $G
 ```
 
@@ -912,7 +916,7 @@ record's `code_matches_autotune`). The environment needs:
 
 Where Helion+CuTe cannot run in an environment, bench the same listing
 without the port and without `--configs-from`
-(`--phases bench --bench-impls inductor,inductor_cd,inductor_max,oracle,memcopy`).
+(`--phases bench --bench-impls inductor,inductor_cd,inductor_cdmk,inductor_max,oracle,memcopy`).
 
 A baseline's kernel that fails to compile, or fails the gate, is an error
 or a `FAIL` of that Inductor compile in the record, like any other. Two
@@ -938,7 +942,7 @@ that no Inductor compile runs right behind Helion code (`bench.py`'s
 carryover check):
 
 ```
---impls inductor,inductor_cd,inductor_max,oracle,helion_triton,helion_cute,inductor_helion_pretuned,memcopy
+--impls inductor,inductor_cd,inductor_cdmk,inductor_max,oracle,helion_triton,helion_cute,inductor_helion_pretuned,memcopy
 ```
 
 - `inductor_helion_pretuned`: the output code in
