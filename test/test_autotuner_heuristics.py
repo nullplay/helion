@@ -4383,6 +4383,7 @@ _CUTE_HEURISTIC_ORDER = (
     "cute_lane_carry_row",
     "cute_transposed_column_reduction",
     "cute_gathered_split_column",
+    "cute_segment_root_rows",
 )
 
 
