@@ -411,3 +411,19 @@ def two_part_row_means(
             acc = acc + torch.sum(b[tile, tile_r].to(torch.float32), -1)
         mean_b[tile] = acc / b.size(1)
     return mean_a, mean_b
+
+
+def two_run_row_norm(x: torch.Tensor, stat: torch.Tensor) -> torch.Tensor:
+    """Each row of a ``[rows, 2, n]`` tensor centred on its mean over its two
+    runs of ``n``, one load per run, the mean also folded into ``stat`` in
+    place: the persistent kernel helion.inductor emits for a BatchNorm over
+    two images, its runs unrolled."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        first = x[tile, 0, :].to(torch.float32)
+        second = x[tile, 1, :].to(torch.float32)
+        mean = torch.sum(first + second, -1) / (2 * x.size(2))
+        out[tile, 0, :] = (first - mean[:, None]).to(out.dtype)
+        out[tile, 1, :] = (second - mean[:, None]).to(out.dtype)
+        stat[tile] = stat[tile] * 0.9 + mean * 0.1
+    return out

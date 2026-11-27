@@ -4433,6 +4433,145 @@ class CuteSegmentRootRowHeuristic(AutotunerHeuristic):
         return seeds
 
 
+def _row_runs(device_ir: DeviceIR) -> int:
+    """The most runs of one tensor that a kernel's loads read side by side:
+    loads in one graph of one tensor, with a full slice, whose subscripts
+    agree but for one integer index, as ``x[tile, 0, :]`` through
+    ``x[tile, 15, :]`` read 16 runs.  1 when no two loads do."""
+    runs: dict[tuple[object, ...], set[int]] = collections.defaultdict(set)
+    for info in device_ir.graphs:
+        for node in info.graph.nodes:
+            if node.op != "call_function" or node.target is not language_load:
+                continue
+            tensor, subscript = node.args[0], node.args[1]
+            if not isinstance(subscript, (list, tuple)):
+                continue
+            ints = [i for i, entry in enumerate(subscript) if type(entry) is int]
+            if len(ints) != 1 or not any(isinstance(e, slice) for e in subscript):
+                continue
+            # Slices are unhashable before Python 3.12.
+            key = (
+                info.graph_id,
+                tensor,
+                *(
+                    None
+                    if i == ints[0]
+                    else str(entry)
+                    if isinstance(entry, slice)
+                    else entry
+                    for i, entry in enumerate(subscript)
+                ),
+            )
+            runs[key].add(subscript[ints[0]])
+    return max((len(found) for found in runs.values()), default=1)
+
+
+class CuteRowRunsHeuristic(AutotunerHeuristic):
+    """Packet seeds for a persistent row that loads several runs of one
+    tensor.
+
+    helion.inductor reads a BatchNorm's rdim, N runs of H * W contiguous
+    elements per channel, as one load per run over a persistent run,
+    ``x[tile, 0, :]`` through ``x[tile, N - 1, :]``, and adds the runs'
+    values before each reduction (its unrolled runs).  The default persistent
+    row (``reduction_loops`` None) of a run that is no power of two renders
+    as one warp of scalar lanes, and no other heuristic seeds a vector layout
+    for it.  One loop chunk of the run's power of two with a packet per
+    thread reads every run in vector loads instead, and the runs stay in
+    registers through the statistics.  better-benchmark's
+    var_mean_0c1c9fc832f4_f584d38d (training BatchNorm over an NCHW
+    [16, 128, 28, 28] bf16, 16 runs of 784 per channel, in-place running
+    statistics) runs best with a chunk of 1024 over 256 threads of 4
+    elements, and 0c1c9fc832f4_56f0f473 (8 runs of 784 over 512 channels)
+    over 128 threads of 8: which packet wins depends on the runs and the
+    channels, so every packet width is a seed.
+
+    Seeds: a grid tile of 1 on every grid axis (one row per CTA), the run's
+    power of two as one chunk, a thread per packet for packets of 16 bytes
+    and narrower down to 2 elements, from 32 to the reduction's most
+    threads, and strided lanes.
+    """
+
+    name = "cute_row_runs"
+    backend = "cute"
+    priority = 107
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(cls.get_seed_configs(env, device_ir))
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        spec = env.config_spec
+        if not _has_one_sized_reduction_loop(spec) or _row_runs(device_ir) < 2:
+            return []
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        if rl_spec.pinned:
+            return []
+        rdim = rl_spec.block_id
+        grid_ids = {b for ids in device_ir.grid_block_ids for b in ids}
+        # Every block a grid block that takes one row per CTA.
+        if {item.block_id for item in spec.block_sizes} != grid_ids or any(
+            not (item._fragment(spec).low <= 1 <= item._fragment(spec).high)
+            for item in spec.block_sizes
+        ):
+            return []
+        for sequence in (
+            spec.num_threads,
+            spec.cute_vector_widths,
+            spec.cute_lane_layouts,
+        ):
+            if rdim not in sequence.valid_block_ids():
+                return []
+        widest = _cute_tile_seed_vec_width_for_dtype(
+            _cute_tile_inner_block_dtype(env, device_ir, rdim)
+        )
+        chunk = next_power_of_2(rl_spec.size_hint)
+        fragment = rl_spec._fragment(spec)
+        if widest <= 1 or not fragment.low <= chunk <= fragment.high:
+            return []
+        max_threads = spec.max_reduction_threads or 1024
+        thread_ids = spec.num_threads.valid_block_ids()
+        seeds: list[Config] = []
+        vec = widest
+        while vec >= 2:
+            threads = chunk // vec
+            if 32 <= threads <= max_threads:
+                seeds.append(
+                    Config.from_dict(
+                        {
+                            "block_sizes": [1] * len(spec.block_sizes),
+                            "reduction_loops": [chunk],
+                            "num_threads": _seq_config_list(
+                                spec.num_threads,
+                                {
+                                    **{b: 1 for b in grid_ids if b in thread_ids},
+                                    rdim: threads,
+                                },
+                            ),
+                            "cute_vector_widths": _seq_config_list(
+                                spec.cute_vector_widths, {rdim: vec}
+                            ),
+                            "cute_lane_layouts": _seq_config_list(
+                                spec.cute_lane_layouts, {rdim: "strided"}
+                            ),
+                        }
+                    )
+                )
+            vec //= 2
+        return seeds
+
+
 def _dependent_launch(spec: ConfigSpec) -> dict[str, bool]:
     """``cute_pdl`` (released at entry, spread to one wave's density) for the
     nested-row seeds where ``griddepcontrol`` exists.
