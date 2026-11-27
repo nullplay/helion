@@ -4311,6 +4311,125 @@ class CuteSiblingRowHeuristic(AutotunerHeuristic):
         return dedupe_configs([*seeds, *packet_seeds])
 
 
+class CuteSegmentRootRowHeuristic(AutotunerHeuristic):
+    """Row seeds for a kernel of several roots, each a row grid whose tile
+    loops pass over rows of one extent.
+
+    helion.inductor emits a reduction over a cat's parts along a pointwise
+    axis as one root per part (segment loops), as DenseNet's BatchNorm
+    over a cat of 64 + 5 * 32 channels. Every root's grid and loop blocks are
+    config entries of their own: few random configs give all six roots
+    layouts that compile together (1 of 20 random configs of that kernel
+    renders), and no other heuristic seeds the kernel. Every root gets the
+    same row config instead: one row per CTA (a grid tile of 1 on every grid
+    axis) and the rounded row as one chunk or two, a packet per thread,
+    strided lanes. That kernel runs 4.33 us at the two-chunk seed, where
+    the cat's one root with a masked load per part runs 8.06 us at its best
+    searched config (GB300)."""
+
+    name = "cute_segment_root_rows"
+    backend = "cute"
+    priority = 106
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(cls.get_seed_configs(env, device_ir))
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        spec = env.config_spec
+        roots = [tuple(ids) for ids in device_ir.grid_block_ids]
+        if spec.matmul_facts or spec.reduction_loops or len(roots) < 2:
+            return []
+        paths = tile_loop_paths(device_ir, device_ir.graphs)
+        if not paths or any(len(path) != 2 or len(path[1]) != 1 for path in paths):
+            return []
+        # Every root a row grid with tile loops of their own, one block each.
+        if {path[0] for path in paths} != set(roots):
+            return []
+        grid_ids = tuple(dict.fromkeys(b for ids in roots for b in ids))
+        inner_ids = tuple(dict.fromkeys(path[1][0] for path in paths))
+        if set(grid_ids) & set(inner_ids):
+            return []
+        block_specs = {item.block_id: item for item in spec.block_sizes}
+        if set(block_specs) != {*grid_ids, *inner_ids} or any(
+            len(item.block_ids) != 1 for item in spec.block_sizes
+        ):
+            return []
+        hints = {block_specs[block_id].size_hint for block_id in inner_ids}
+        if len(hints) != 1:
+            return []
+        for sequence in (
+            spec.num_threads,
+            spec.cute_vector_widths,
+            spec.cute_lane_layouts,
+        ):
+            if not set(inner_ids).issubset(sequence.valid_block_ids()):
+                return []
+        vec = min(
+            _cute_tile_seed_vec_width_for_dtype(
+                _cute_tile_inner_block_dtype(env, device_ir, block_id)
+            )
+            for block_id in inner_ids
+        )
+        if vec <= 1:
+            return []
+        if any(
+            not (fragment.low <= 1 <= fragment.high)
+            for fragment in (block_specs[b]._fragment(spec) for b in grid_ids)
+        ):
+            return []
+        inner_fragments = [block_specs[b]._fragment(spec) for b in inner_ids]
+        low = max(fragment.low for fragment in inner_fragments)
+        high = min(fragment.high for fragment in inner_fragments)
+        (hint,) = hints
+        row_extent = 1 << (max(1, hint) - 1).bit_length()
+        thread_ids = spec.num_threads.valid_block_ids()
+        seeds: list[Config] = []
+        for chunk in dict.fromkeys((row_extent // 2, row_extent)):
+            threads = chunk // vec
+            if not (32 <= threads <= 1024 and low <= chunk <= high):
+                continue
+            seeds.append(
+                Config.from_dict(
+                    {
+                        "block_sizes": _seq_config_list(
+                            spec.block_sizes,
+                            {
+                                **dict.fromkeys(grid_ids, 1),
+                                **dict.fromkeys(inner_ids, chunk),
+                            },
+                        ),
+                        "num_threads": _seq_config_list(
+                            spec.num_threads,
+                            {
+                                **{b: 1 for b in grid_ids if b in thread_ids},
+                                **dict.fromkeys(inner_ids, threads),
+                            },
+                        ),
+                        "cute_vector_widths": _seq_config_list(
+                            spec.cute_vector_widths, dict.fromkeys(inner_ids, vec)
+                        ),
+                        "cute_lane_layouts": _seq_config_list(
+                            spec.cute_lane_layouts,
+                            dict.fromkeys(inner_ids, "strided"),
+                        ),
+                    }
+                )
+            )
+        return seeds
+
+
 def _dependent_launch(spec: ConfigSpec) -> dict[str, bool]:
     """``cute_pdl`` (released at entry, spread to one wave's density) for the
     nested-row seeds where ``griddepcontrol`` exists.

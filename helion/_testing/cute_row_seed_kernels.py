@@ -389,3 +389,25 @@ def row_norm_with_running_mean(x: torch.Tensor, stat: torch.Tensor) -> torch.Ten
         out[tile, :] = (row - mean[:, None]).to(out.dtype)
         stat[tile] = stat[tile] * 0.9 + mean * 0.1
     return out
+
+
+def two_part_row_means(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The means of the rows of two tensors whose rows have one length, each
+    tensor in a root loop of its own over its rows, with a loop over each
+    row's elements: the kernel of a reduction over a cat's two parts that
+    helion.inductor emits as segment loops."""
+    mean_a = torch.empty(a.size(0), dtype=torch.float32, device=a.device)
+    mean_b = torch.empty(b.size(0), dtype=torch.float32, device=b.device)
+    for tile in hl.tile(a.size(0)):
+        acc = hl.zeros([tile], dtype=torch.float32)
+        for tile_r in hl.tile(a.size(1)):
+            acc = acc + torch.sum(a[tile, tile_r].to(torch.float32), -1)
+        mean_a[tile] = acc / a.size(1)
+    for tile in hl.tile(b.size(0)):
+        acc = hl.zeros([tile], dtype=torch.float32)
+        for tile_r in hl.tile(b.size(1)):
+            acc = acc + torch.sum(b[tile, tile_r].to(torch.float32), -1)
+        mean_b[tile] = acc / b.size(1)
+    return mean_a, mean_b

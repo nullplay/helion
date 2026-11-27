@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import functools
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -28,6 +29,7 @@ from helion._compiler.cute.autotune.heuristics.cute import CuteRolledRowLadderHe
 from helion._compiler.cute.autotune.heuristics.cute import (
     CuteRolledRowLoadsFirstHeuristic,
 )
+from helion._compiler.cute.autotune.heuristics.cute import CuteSegmentRootRowHeuristic
 from helion._compiler.cute.autotune.heuristics.cute import _is_sole_row_reduction
 from helion._compiler.cute.autotune.heuristics.cute import _row_tile_axes
 from helion._compiler.cute.autotune.heuristics.cute import _row_tile_groups
@@ -61,6 +63,7 @@ from helion._testing.cute_row_seed_kernels import (
 from helion._testing.cute_row_seed_kernels import (
     tiled_first_elements_then_grid_row_norm,
 )
+from helion._testing.cute_row_seed_kernels import two_part_row_means
 from helion._testing.cute_row_seed_kernels import two_row_norms_in_swapped_tile_orders
 from helion._testing.cute_row_seed_kernels import two_row_norms_over_tiles_of_their_own
 from helion._testing.cute_row_seed_kernels import two_row_norms_sharing_a_block_size
@@ -722,3 +725,41 @@ def test_a_row_shorter_than_the_loads_first_chunk_gets_its_one_trip_chunk() -> N
     assert chunks == [[2048], [512]]
     assert _refusal(bound, seeds[0]) is not None
     assert _refusal(bound, seeds[1]) is None
+
+
+def test_segment_roots_share_one_row_config() -> None:
+    """Two root loops over rows of 3136 bf16 elements, the parts of a cat that
+    helion.inductor emits as segment loops: each root gets the same row
+    config, one row per CTA and the row rounded to 4096 as two chunks of
+    2048 or one, a packet of 8 per thread over 256 or 512 threads, and both
+    seeds render. Rows of two lengths get none."""
+    bound = _bind(two_part_row_means, (64, 3136), (32, 3136))
+    seeds = _seeds(CuteSegmentRootRowHeuristic, bound)
+    spec = bound.config_spec
+    loops = [item.block_id for item in spec.block_sizes if item.size_hint == 3136]
+    assert len(loops) == 2
+    found = []
+    for seed in seeds:
+        blocks = dict(
+            zip(
+                (item.block_id for item in spec.block_sizes),
+                seed.block_sizes,
+                strict=True,
+            )
+        )
+        threads = dict(
+            zip(
+                (item.block_id for item in spec.num_threads),
+                seed.num_threads,
+                strict=True,
+            )
+        )
+        found.append(({blocks[b] for b in loops}, {threads[b] for b in loops}))
+        with patch(
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
+            return_value=227 * 1024,
+        ):
+            assert _refusal(bound, seed) is None
+    assert found == [({2048}, {256}), ({4096}, {512})]
+    unequal = _bind(two_part_row_means, (64, 3136), (32, 1000))
+    assert not _seeds(CuteSegmentRootRowHeuristic, unequal)
