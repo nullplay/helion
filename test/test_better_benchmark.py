@@ -3494,9 +3494,9 @@ def test_fastest_inductor_pools_the_compiles_that_ended_on_one_code() -> None:
         "inductor_max": _compile([10.0, 10.0, 9.6, 9.6, 9.8, 9.8]),
         "helion_cute": {"status": "ok", "cold_us": 10.0, "cold_runs_us": [10.0] * 6},
     }
-    assert [impls[impl]["cold_us"] for impl in common.INDUCTOR_IMPLS] == [
-        pytest.approx(value) for value in (10.0, 10.2, 9.8)
-    ]
+    assert [
+        impls[impl]["cold_us"] for impl in common.INDUCTOR_IMPLS if impl in impls
+    ] == [pytest.approx(value) for value in (10.0, 10.2, 9.8)]
     assert common.fastest_inductor(impls) == {
         "same_code": [["inductor", "inductor_cd", "inductor_max"]],
         "cold_us": {"headline": pytest.approx(9.8), "debiased": pytest.approx(10.0)},
@@ -6200,8 +6200,8 @@ def test_a_campaign_adds_rotating_timings_to_another_runs_picks(
         assert f"--configs-dir {run / 'configs'} " in command
         # Of the Helion ports, the selected backend's only.
         assert command.endswith(
-            "--impls inductor,inductor_cd,inductor_max,oracle,helion_triton,memcopy "
-            "--rotate-inputs 8"
+            "--impls inductor,inductor_cd,inductor_cdmk,inductor_max,oracle,"
+            "helion_triton,memcopy --rotate-inputs 8"
         )
     # The earlier run is as it was.
     assert {
@@ -6445,7 +6445,10 @@ def test_configs_from_benches_only_the_ports_whose_picks_it_takes(
         return copied["records"], ",".join(copied["bench_impls"]), jobs
 
     # Both backends: every implementation, in bench.py's order.
-    every = "inductor,inductor_cd,inductor_max,oracle,helion_triton,helion_cute,memcopy"
+    every = (
+        "inductor,inductor_cd,inductor_cdmk,inductor_max,oracle,helion_triton,"
+        "helion_cute,memcopy"
+    )
     assert every == ",".join(common.ALL_IMPLS)
     assert start(first, "cute,triton") == ([cute, triton], every, 1)
     times = {"inductor": 2.0, "helion_cute": 1.0, "helion_triton": 1.5}
@@ -8771,12 +8774,14 @@ def test_the_max_autotune_compile_takes_the_modes_options_without_its_graph_wrap
     for impl in common.INDUCTOR_IMPLS:
         common.compile_inductor("r", "s", object(), impl=impl)
     policy = {"inductor": {"some_option": 1}}
+    multi_kernel = {"coordinate_descent_tuning": True, "triton.multi_kernel": 1}
     assert calls == [
         {"compile_policy": policy},
         {"compile_policy": policy, "options": {"coordinate_descent_tuning": True}},
+        {"compile_policy": policy, "options": multi_kernel},
         {"compile_policy": policy, "options": options},
     ]
-    assert common.ALL_IMPLS[:3] == common.INDUCTOR_IMPLS
+    assert common.ALL_IMPLS[:4] == common.INDUCTOR_IMPLS
     assert set(common.INDUCTOR_IMPLS) <= set(bench.GATED_IMPLS)
 
     record = {
@@ -8793,7 +8798,8 @@ def test_the_max_autotune_compile_takes_the_modes_options_without_its_graph_wrap
     times = [
         report.impl_time(record, impl, "cold_us") for impl in common.INDUCTOR_IMPLS
     ]
-    assert times == [100.0, 90.0, 80.0]
+    # The record times no inductor_cdmk.
+    assert times == [100.0, 90.0, None, 80.0]
 
 
 def test_the_max_autotune_compile_counts_in_each_process_of_a_repeated_bench(
@@ -8861,10 +8867,11 @@ def test_the_max_autotune_compile_counts_in_each_process_of_a_repeated_bench(
     assert row["cute_vs_inductor"] == pytest.approx(84 / 85)
     assert row["inductor"] == 84.0 and row["counted"] == ["inductor", "helion_cute"]
     assert row["inductor_missing"] == {"inductor_max": [names[2]]}
-    assert list(row["inductor_configs"]) == list(common.INDUCTOR_IMPLS)
+    # The compiles the records hold (no inductor_cdmk).
+    assert list(row["inductor_configs"]) == ["inductor", "inductor_cd", "inductor_max"]
     assert len(row["inductor_configs"]["inductor_max"]) == 3
-    assert list(row["numerics"])[:3] == list(common.INDUCTOR_IMPLS)
-    assert list(row["kernels"])[:3] == list(common.INDUCTOR_IMPLS)
+    assert list(row["numerics"])[:4] == list(common.INDUCTOR_IMPLS)
+    assert list(row["kernels"])[:4] == list(common.INDUCTOR_IMPLS)
     assert rows["s2"]["inductor"] == 80.0
     assert rows["s2"]["cute_vs_inductor"] == pytest.approx(80 / 60)
     shapes = {s["name"]: s["ratio"] for s in json.loads(goal.read_text())["shapes"]}
@@ -8906,3 +8913,51 @@ def test_a_runs_report_names_the_triton_build_of_its_records(
     assert common.triton_label(_toy_backend("tileir")) == (
         "tileir: triton 3.9.0+gitb7d, ENABLE_TILE=1, Inductor's launcher off"
     )
+
+
+def test_inductor_cdmk_adds_multi_kernel_reductions_to_coordinate_descent():
+    """inductor_cdmk: inductor_cd with Inductor's multi-kernel reductions,
+    each a persistent and a looped kernel of which the first call keeps the
+    faster, listed right after inductor_cd. helion.inductor's compile takes
+    no multi_kernel option."""
+    assert common.inductor_options("inductor_cd") == {"coordinate_descent_tuning": True}
+    assert common.inductor_options("inductor_cdmk") == {
+        "coordinate_descent_tuning": True,
+        "triton.multi_kernel": 1,
+    }
+    assert "inductor_cdmk" in common.INDUCTOR_IMPLS
+    listing = list(common.ALL_IMPLS)
+    assert listing.index("inductor_cdmk") == listing.index("inductor_cd") + 1
+    assert not any("multi_kernel" in key for key in common.inductor_helion_options())
+
+
+def test_multi_kernel_picks_records_each_multi_kernels_kept_sub_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """common.multi_kernel_picks: the sub-kernel each multi-kernel keeps at
+    its first run in the block, once per multi-kernel, and MultiKernelCall.run
+    as it was after the block."""
+    from torch._inductor.codegen.multi_kernel import MultiKernelCall
+
+    def fake_run(self: object, *args: object, **kwargs: object) -> str:
+        self.picked_kernel = 1  # type: ignore[attr-defined]
+        return "ran"
+
+    monkeypatch.setattr(MultiKernelCall, "run", fake_run)
+    call = MultiKernelCall.__new__(MultiKernelCall)
+    call.multi_kernel_name = "multi_kernel_0"
+    call._kernels = [
+        types.SimpleNamespace(inductor_meta={"kernel_name": "triton_per_fused_0"}),
+        types.SimpleNamespace(inductor_meta={"kernel_name": "triton_red_fused_0"}),
+    ]
+    with common.multi_kernel_picks() as picks:
+        assert MultiKernelCall.run(call) == "ran"
+        MultiKernelCall.run(call)
+    assert picks == [
+        {
+            "multi_kernel": "multi_kernel_0",
+            "kernels": ["triton_per_fused_0", "triton_red_fused_0"],
+            "picked": "triton_red_fused_0",
+        }
+    ]
+    assert MultiKernelCall.run is fake_run

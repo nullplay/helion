@@ -1446,8 +1446,9 @@ def main() -> None:
                 "The config that each Triton kernel of Inductor's compiles "
                 "ended on in the bench (block sizes, a mix-order reduction's "
                 "`RSPLIT_SIZE` among them, warps, stages). Coordinate descent "
-                "tunes `inductor_cd` and `inductor_max` again in every bench "
-                "process, and its pick moves a reading (README, Baseline)."
+                "tunes `inductor_cd`, `inductor_cdmk` and `inductor_max` again "
+                "in every bench process, and its pick moves a reading (README, "
+                "Baseline)."
             ),
             "",
             *picks,

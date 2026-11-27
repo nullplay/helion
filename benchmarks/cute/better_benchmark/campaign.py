@@ -191,11 +191,11 @@ another build's or switch state's, so a restart from a shell without the
 baseline's environment adds no stock record to a baseline's run. A
 baseline run keeps the main run's listing of implementations, the default
 with ``--configs-from`` and ``--backends cute``
-(``inductor,inductor_cd,inductor_max,oracle,helion_cute,memcopy``), so that
-each is timed in the slot and between the neighbours it has in the main
+(``inductor,inductor_cd,inductor_cdmk,inductor_max,oracle,helion_cute,memcopy``),
+so that each is timed in the slot and between the neighbours it has in the main
 run's rounds. Where Helion cannot run in an environment, ``--phases bench
---bench-impls inductor,inductor_cd,inductor_max,oracle,memcopy`` without
-``--configs-from`` benches that listing without the port.
+--bench-impls inductor,inductor_cd,inductor_cdmk,inductor_max,oracle,memcopy``
+without ``--configs-from`` benches that listing without the port.
 
 ``--seeds-from RUN`` pairs this run's searches with another run's, for a
 before/after comparison of two trees. On a large kernel the pick of a cold

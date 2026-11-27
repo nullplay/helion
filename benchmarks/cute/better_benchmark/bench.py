@@ -5,6 +5,12 @@ Implementations (``--impls``):
 
 - ``inductor``: ``torch.compile`` of the repro, default Inductor config
 - ``inductor_cd``: the same with ``coordinate_descent_tuning=True``
+- ``inductor_cdmk``: ``inductor_cd`` with ``triton.multi_kernel=1``: a
+  reduction compiles both its persistent and its looped kernel, and the
+  first call keeps the faster (``MultiKernelCall``); the warm-up call ahead
+  of every CUDA-graph capture makes that pick, so the captured graph launches
+  the kept kernel, which ``inductor_configs`` names; ``multi_kernel_picks``
+  lists each pick (``common.multi_kernel_picks``)
 - ``inductor_max``: the same with the options of
   ``torch.compile(mode="max-autotune")`` (``max_autotune`` and
   ``coordinate_descent_tuning``; ``common.inductor_options`` says why the
@@ -1242,8 +1248,13 @@ def run(args: argparse.Namespace, backend: dict[str, Any] | None) -> dict[str, A
                 else:
                     raise ValueError(f"unknown implementation {impl}")
                 replay = _replayed(call, inputs)
-                with torch.no_grad():
+                with common.multi_kernel_picks() as picks, torch.no_grad():
                     actual = replay(inputs())
+                if picks:
+                    # Each multi-kernel's pick (inductor_cdmk), made by the
+                    # warm-up call ahead of the capture: the kernel the timers
+                    # replay.
+                    info["multi_kernel_picks"] = picks
                 if impl in common.INDUCTOR_IMPLS:
                     # The config each of the compile's Triton kernels ended
                     # on: coordinate descent tunes again in every process,
