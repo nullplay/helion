@@ -35,6 +35,7 @@ from torch.utils._sympy.functions import Identity
 from . import config
 from .codegen.kernel import RDIM_SEGMENT_MIN
 from .codegen.kernel import RDIM_SEGMENTS_MAX
+from .codegen.kernel import UNROLL_RUNS_MAX
 from .codegen.kernel import UNSPLIT_LAYOUT
 from .codegen.kernel import HelionKernel
 from .codegen.tiling import REDUCTION_RUNS_MAX
@@ -148,6 +149,9 @@ MIN_LAYOUT_SPLIT_VALUES = 2**20
 # values the split wins ([18, 512, 16, 16] 10.06 vs 7.58).
 WIDE_LAYOUT_SPLIT_VALUES = 2**21
 MAX_UNSPLIT_RDIM = 8192
+# The Welfords HelionKernel reads by runs when it is persistent and unrolls them
+# (HelionKernel.rdim_runs(), unroll_runs()).
+WELFORD_RUN_REDUCTIONS = OrderedSet([torch.ops.aten.var_mean])
 # The reductions HelionKernel reads as a tile of their runs (rdim_runs()):
 # those whose partials of the runs combine as their blocks' do.
 RUN_REDUCTIONS = OrderedSet(
@@ -712,8 +716,16 @@ def reads_long_runs(node: BaseSchedulerNode) -> bool:
     tile, runs of more than UNROLLED_RDIM_MAX values that it reads in a loop
     or in a block Helion rolls, as a looped split's first kernel reads its
     chunks: HelionKernel.rdim_runs(), asked of the kernel of the nodes of
-    `node` (a kernel with a Welford or an argmax reads the flat rdim)."""
+    `node` (a kernel with an argmax reads the flat rdim). Not a Welford's,
+    whose runs HelionKernel.rdim_runs() takes only to unroll them in a
+    persistent kernel without masked parts, which loops over no run."""
     if not node.is_reduction() or isinstance(node, FusedMixOrderReductions):
+        return False
+    if any(
+        isinstance(sn, SchedulerNode)
+        and cast("ComputedBuffer", sn.node).get_reduction_type() == "welford_reduce"
+        for sn in node.get_nodes()
+    ):
         return False
     # masked_into_looped_split() asks on a CUDA device with cuda_backend
     # "helion": HelionScheduling, a SIMD backend, whose group is the node's
@@ -820,6 +832,77 @@ def reads_reduction(node: torch.fx.Node) -> bool:
             return True
         stack.extend(current.all_input_nodes)
     return False
+
+
+# The FX users normalized_by() follows from a reduction before it gives up
+# (and answers no): the normalization reads the statistics a few nodes after
+# them (getitem, a broadcast, rsqrt(var + eps)).
+NORMALIZED_BY_NODES = 16
+
+
+# The dtype conversions normalized_by() looks through: a bf16 BatchNorm's
+# var_mean reads x converted to float32, and its normalization reads x itself,
+# sub(arg0_1, getitem_1), whose promotion converts it.
+CONVERSIONS = OrderedSet(
+    [torch.ops.prims.convert_element_type.default, torch.ops.aten._to_copy.default]
+)
+
+
+def normalized_by(node: torch.fx.Node) -> bool:
+    """Whether the input of FX node `node`, a var_mean, is read again by a
+    node that reads `node`'s outputs too, among the first NORMALIZED_BY_NODES
+    nodes computed from them: the normalization of a BatchNorm or LayerNorm,
+    (x - mean) * rsqrt(var + eps), which reads the rdim again after its
+    statistics and makes their kernel persistent under the CuTe backend
+    (PERSISTENT_WELFORD_RDIM, rereads_rdim()). The input counts before its
+    dtype conversions as well (CONVERSIONS)."""
+    inputs = node.all_input_nodes
+    if not inputs:
+        return False
+    computed: OrderedSet[torch.fx.Node] = OrderedSet()
+    queue = list(node.users)
+    while queue and len(computed) < NORMALIZED_BY_NODES:
+        current = queue.pop(0)
+        if current in computed:
+            continue
+        computed.add(current)
+        queue.extend(current.users)
+    sources = [inputs[0]]
+    while (
+        sources[-1].op == "call_function"
+        and sources[-1].target in CONVERSIONS
+        and sources[-1].all_input_nodes
+    ):
+        sources.append(sources[-1].all_input_nodes[0])
+    return any(
+        user is not node and user in computed
+        for source in sources
+        for user in source.users
+    )
+
+
+# The ops whose output is masked parts (ops.masked()): a cat's, a pad's.
+MASKED_PART_OPS = OrderedSet(
+    [torch.ops.aten.cat.default, torch.ops.aten.constant_pad_nd.default]
+)
+
+
+def reads_masked_parts(node: torch.fx.Node) -> bool:
+    """Whether the input of FX node `node`, before its dtype conversions
+    (CONVERSIONS), is a cat or a pad: a BatchNorm over a cat of channels,
+    whose kernel reads masked parts, which HelionKernel.rdim_runs() does not
+    unroll (masked_parts())."""
+    inputs = node.all_input_nodes
+    if not inputs:
+        return False
+    source = inputs[0]
+    while (
+        source.op == "call_function"
+        and source.target in CONVERSIONS
+        and source.all_input_nodes
+    ):
+        source = source.all_input_nodes[0]
+    return source.op == "call_function" and source.target in MASKED_PART_OPS
 
 
 class HelionChoices(InductorChoices):
@@ -1126,7 +1209,7 @@ class HelionChoices(InductorChoices):
             split > 1
             or (
                 HelionChoices.layout_split_pays(reduction_numel_hint, numel_hint)
-                and not HelionChoices.reads_runs(layout)
+                and not HelionChoices.reads_runs(layout, reduction_numel_hint)
             )
         ):
             return layout
@@ -1167,7 +1250,7 @@ class HelionChoices(InductorChoices):
         )
 
     @staticmethod
-    def reads_runs(runs: int) -> bool:
+    def reads_runs(runs: int, reduction_numel: int) -> bool:
         """Whether the reduction V.graph.current_node lowers, over `runs` runs
         of its input (layout_split()), is one HelionKernel reads as a tile of
         its runs (HelionKernel.rdim_runs()): a sum, mean, prod, amax, amin or
@@ -1182,12 +1265,35 @@ class HelionChoices(InductorChoices):
         Under the CuTe backend, not one whose input reads another reduction (the
         sum of (x - x.mean(...)) ** 2, a variance): HelionKernel.rdim_runs()
         leaves such a kernel to the flat rdim there, and the layout split, where
-        it pays, reads its runs as views."""
+        it pays, reads its runs as views. Also under the CuTe backend, a
+        var_mean over at most UNROLL_RUNS_MAX runs whose statistics normalize
+        its input (normalized_by()), a BatchNorm in training, and not over a
+        cat or a pad (reads_masked_parts()): its persistent kernel reads each
+        run as a load of its own (unroll_runs()), as for an NCHW [16, 128,
+        28, 28] bf16 with its running statistics (better-benchmark's
+        var_mean_0c1c9fc832f4_f584d38d), which ran faster than the layout
+        split's three kernels (GB300)."""
         node = V.graph.current_node
+        if node is None or not isinstance(node.target, torch._ops.OpOverload):
+            return False
+        if node.target.overloadpacket in WELFORD_RUN_REDUCTIONS:
+            # Under the CuTe backend, a var_mean over at most UNROLL_RUNS_MAX
+            # runs whose input its statistics normalize: its kernel, which
+            # reads the rdim again, is persistent and unrolls the runs
+            # (unroll_runs()). One that only reduces loops over the rdim,
+            # which HelionKernel.rdim_runs() reads flat, and one over a cat or
+            # a pad, whose runs it does not unroll (masked_parts()): the
+            # layout split pays for them.
+            return (
+                config.backend == "cute"
+                and runs <= UNROLL_RUNS_MAX
+                and reduction_numel <= PERSISTENT_WELFORD_RDIM
+                and not reads_reduction(node)
+                and not reads_masked_parts(node)
+                and normalized_by(node)
+            )
         return (
             runs <= REDUCTION_RUNS_MAX
-            and node is not None
-            and isinstance(node.target, torch._ops.OpOverload)
             and node.target.overloadpacket in RUN_REDUCTIONS
             and not (config.backend == "cute" and reads_reduction(node))
         )

@@ -26,6 +26,7 @@ if not requires_torch_version("2.16"):
     pytest.skip("helion.inductor needs torch 2.16", allow_module_level=True)
 
 from helion.inductor.codegen.kernel import HelionKernel
+from helion.inductor.codegen.unroll_runs import unroll_runs
 
 pytestmark = pytest.mark.cpu_only
 
@@ -739,6 +740,174 @@ class TestPersistentLoad(TestCase):
             "tmp0 = hl.load(__arg0__, [tile_x, slice(None)],"
             " extra_mask=mask.reshape([tile_x, 1]))\n",
         )
+
+
+# A persistent kernel that reads its rdim as 2 runs of a tile of the runs
+# (HelionKernel.rdim_runs()): the mean over both runs, each run centered on it,
+# and the mean written in place into in1.
+RUNS_KERNEL = """\
+@helion.kernel(backend="cute", static_shapes=True)
+def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
+    for tile_x, tile_q in hl.tile([8, 2], block_size=[None, 2]):
+        tmp0 = in0[tile_x, tile_q, :].to(torch.float32)
+        tmp1 = in1[tile_x]
+        tmp2 = torch.sum(tmp0, -1)
+        tmp3 = torch.sum(tmp2, -1)
+        tmp4 = tmp3.reshape([tile_x, 1, 1])
+        tmp5 = tmp1.reshape([tile_x, 1, 1])
+        out0[tile_x, tile_q, :] = ((tmp0 - tmp4) * tmp5).to(torch.bfloat16)
+        in1[tile_x] = tmp3
+"""
+
+
+# The forms of a run's index that the kernel of a cat's parts takes (DenseNet's
+# BatchNorm over a cat of channels): a masked load of a part's view at the
+# runs' tile, one flat over a part, and rdim from a run's load.
+CAT_RUNS_KERNEL = """\
+@helion.kernel(backend="cute", static_shapes=True)
+def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
+    for tile_x, tile_q in hl.tile([96, 2], block_size=[None, 2]):
+        rdim = in0[tile_x, tile_q, :].size(2)
+        tmp0 = tile_x.index < 64
+        tmp1 = hl.load(in0, [tile_x, tile_q, slice(None)], extra_mask=tmp0.reshape([tile_x, 1, 1]))
+        tmp2 = hl.load(in1, [(-64) + tile_x.index.reshape([tile_x, 1]) + 32*tile_q.index, slice(None)])
+        tmp3 = hl.load(in1, [hl.arange(rdim) + 49*tile_x.index.reshape([tile_x, 1, 1]) + 1568*tile_q.index.reshape([tile_q, 1])])
+        tmp4 = torch.where(tmp0.reshape([tile_x, 1, 1]), tmp1, tmp2 + tmp3)
+        tmp5 = torch.sum(tmp4, -1)
+        tmp6 = torch.sum(tmp5, -1)
+        out0[tile_x] = tmp6
+"""
+
+
+class TestUnrollRuns(TestCase):
+    """unroll_runs(): one value per run instead of a tile of the runs, added
+    elementwise before each reduction over the run; None for a kernel it does
+    not recognize."""
+
+    def test_one_value_per_run(self):
+        source = unroll_runs(RUNS_KERNEL, 2)
+        assert source is not None
+        lines = [line.strip() for line in source.splitlines()]
+        for line in (
+            "for tile_x in hl.tile(8):",
+            "tmp0_0 = in0[tile_x, 0, :].to(torch.float32)",
+            "tmp0_1 = in0[tile_x, 1, :].to(torch.float32)",
+            # The sum over each run and the sum over the runs: one sum of the
+            # runs' values added elementwise.
+            "tmp3 = torch.sum(tmp0_0 + tmp0_1, -1)",
+            # Reshapes drop the runs' dim, also of values that are no run's.
+            "tmp4 = tmp3.reshape([tile_x, 1])",
+            "tmp5 = tmp1.reshape([tile_x, 1])",
+            "out0[tile_x, 0, :] = ((tmp0_0 - tmp4) * tmp5).to(torch.bfloat16)",
+            "out0[tile_x, 1, :] = ((tmp0_1 - tmp4) * tmp5).to(torch.bfloat16)",
+            "in1[tile_x] = tmp3",
+        ):
+            self.assertIn(line, lines)
+        self.assertNotIn("tile_q", source)
+        self.assertNotIn("tmp2", source)
+
+    def test_padded_block_of_runs(self):
+        # 3 runs in a block of 4, whose lane past the runs the tile masks: the
+        # copies are the runs' 3.
+        source = unroll_runs(
+            RUNS_KERNEL.replace(
+                "[8, 2], block_size=[None, 2]", "[8, 3], block_size=[None, 4]"
+            ),
+            3,
+        )
+        assert source is not None
+        self.assertIn("tmp3 = torch.sum(tmp0_0 + (tmp0_1 + tmp0_2), -1)", source)
+        self.assertNotIn("tmp0_3", source)
+
+    def test_run_indices(self):
+        source = unroll_runs(CAT_RUNS_KERNEL, 2)
+        assert source is not None
+        lines = [line.strip() for line in source.splitlines()]
+        for line in (
+            "rdim = in0[tile_x, 0, :].size(1)",
+            "tmp1_1 = hl.load(in0, [tile_x, 1, slice(None)], extra_mask=tmp0.reshape([tile_x, 1]))",
+            "tmp2_1 = hl.load(in1, [-64 + tile_x.index.reshape([tile_x]) + 32 * 1, slice(None)])",
+            "tmp3_1 = hl.load(in1, [hl.arange(rdim) + 49 * tile_x.index.reshape([tile_x, 1]) + 1568 * 1])",
+            "tmp6 = torch.sum(tmp4_0 + tmp4_1, -1)",
+        ):
+            self.assertIn(line, lines)
+        self.assertNotIn("tile_q", source)
+
+    def test_declines(self):
+        # Another count of runs than the tile's.
+        self.assertIsNone(unroll_runs(RUNS_KERNEL, 3))
+        cases = {
+            # A block of fewer lanes than runs.
+            "block": RUNS_KERNEL.replace(
+                "[8, 2], block_size=[None, 2]", "[8, 2], block_size=[None, 1]"
+            ),
+            # A tiled outer axis.
+            "tiled x": RUNS_KERNEL.replace("block_size=[None, 2]", "block_size=[4, 2]"),
+            # A reshape that keeps a dim of the runs.
+            "reshape": RUNS_KERNEL.replace(
+                "tmp4 = tmp3.reshape([tile_x, 1, 1])",
+                "tmp4 = tmp0.reshape([tile_x, 2, 16])",
+            ),
+            # A sum over each run that something but the sum over the runs
+            # reads.
+            "partial": RUNS_KERNEL.replace(
+                "tmp3 = torch.sum(tmp2, -1)", "tmp3 = torch.sum(tmp2 * 2.0, -1)"
+            ),
+            # Another reduction over each run than a sum: its reduction over
+            # the runs would take the runs' values otherwise than added.
+            "amax": RUNS_KERNEL.replace(
+                "tmp2 = torch.sum(tmp0, -1)\n        tmp3 = torch.sum(tmp2, -1)",
+                "tmp2 = torch.amax(tmp0, -1)\n        tmp3 = torch.amax(tmp2, -1)",
+            ),
+            # A sum over each run read twice, which the first sum over the
+            # runs drops.
+            "twice": RUNS_KERNEL.replace(
+                "tmp4 = tmp3.reshape([tile_x, 1, 1])",
+                "tmp4 = torch.sum(tmp2, -1).reshape([tile_x, 1, 1])",
+            ),
+            # A run's values stored where no index of the run tells them apart.
+            "store": RUNS_KERNEL.replace(
+                "out0[tile_x, tile_q, :] = ", "out0[tile_x, 0, :] = "
+            ),
+            # A statement that is no assignment.
+            "statement": RUNS_KERNEL.replace(
+                "in1[tile_x] = tmp3", "if tmp3:\n            in1[tile_x] = tmp3"
+            ),
+            # tile_q read as a tile, which a run's index cannot stand for:
+            # its begin, and its size in a shape.
+            "begin": RUNS_KERNEL.replace(
+                "tmp1 = in1[tile_x]", "tmp1 = in1[tile_x] + tile_q.begin"
+            ),
+            "shape": RUNS_KERNEL.replace(
+                "tmp1 = in1[tile_x]",
+                "tmp1 = hl.zeros([tile_x, tile_q], dtype=torch.float32)",
+            ),
+            # A tensor method of an expression of the run's index alone,
+            # which the run's number, a Python int, lacks.
+            "method": RUNS_KERNEL.replace(
+                "tmp1 = in1[tile_x]",
+                "tmp1 = in1[tile_x] + tile_q.index.reshape([tile_q, 1]).to(torch.int64)",
+            ),
+            "method of an expression": RUNS_KERNEL.replace(
+                "tmp1 = in1[tile_x]",
+                "tmp1 = in1[tile_x] + (784 * tile_q.index).to(torch.int64)",
+            ),
+            # Dims named by position, which the unrolled kernel numbers one
+            # lower past the runs' dim.
+            "unsqueeze": RUNS_KERNEL.replace(
+                "tmp4 = tmp3.reshape([tile_x, 1, 1])", "tmp4 = tmp3.unsqueeze(1)"
+            ),
+            "dim": RUNS_KERNEL.replace(
+                "tmp2 = torch.sum(tmp0, -1)", "tmp2 = torch.sum(tmp0, 2)"
+            ),
+            "indexing": RUNS_KERNEL.replace(
+                "tmp4 = tmp3.reshape([tile_x, 1, 1])", "tmp4 = tmp3[:, None, None]"
+            ),
+        }
+        for name, source in cases.items():
+            with self.subTest(name):
+                self.assertNotEqual(source, RUNS_KERNEL)
+                self.assertIsNone(unroll_runs(source, 2))
 
 
 if __name__ == "__main__":
