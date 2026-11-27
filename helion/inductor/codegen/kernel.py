@@ -432,6 +432,15 @@ def reduce_call(fn: str, value: CSEVariable, tile: str, dtype: torch.dtype) -> s
     return f"torch.{fn}({', '.join(args)})"
 
 
+def shared_rdim_block(shared: dict[str, str], index: int) -> str:
+    """The name of the r block that pass `index` of a group of shared segment
+    loops shares (HelionKernel.shared_segment_blocks()). A reduction that a
+    later pass of the kernel reads again, as a LayerNorm's normalize reads its
+    statistics, loops over tile_r once per pass, and each pass keeps a block of
+    its own across the group: block_r0, then block_r0_1."""
+    return shared["r0_"] + (f"_{index}" if index else "")
+
+
 class HelionKernel(SIMDKernel[CSEVariable]):
     """A Helion kernel: pointwise range trees become one hl.tile loop and the
     reduction range tree an inner hl.tile loop, or, in a persistent reduction
@@ -557,6 +566,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         # codegen_segment_loops() and end_segment_loop().
         self.segment_loops = False
         self.segment_bodies: list[tuple[int, int, IndentedBuffer]] = []
+        # The passes over tile_r of the segment loop being emitted, and the most
+        # of any segment of each length (shared_rdim_block()).
+        self.segment_pass = 0
+        self.segment_passes: dict[int, int] = {}
 
     def __enter__(self) -> Self:
         if self.mix_order_reduction and "y" not in self.symbols:
@@ -1628,8 +1641,18 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         # buffer only the kernel reads is not written (remove_kernel_local_buffers()).
         if self.rolled:
             # tile_r spans one run in a kernel that reads them as a tile
-            # (rdim_runs()).
-            self.body.writeline(f"for tile_r in hl.tile({self.extents['r0_']}):")
+            # (rdim_runs()); in a segment's loop of its own, the r block of
+            # this pass that the loops of its length share (shared_rdim_block()).
+            shared = (
+                self.shared_segment_blocks(int(self.extents[self.axis_segment[0]]))
+                if self.segment_loops and self.axis_segment is not None
+                else None
+            )
+            block = ""
+            if shared:
+                block = f", block_size={shared_rdim_block(shared, self.segment_pass)}"
+                self.segment_pass += 1
+            self.body.writeline(f"for tile_r in hl.tile({self.extents['r0_']}{block}):")
             with self.body.indent():
                 self.body.splice(self.loads)
                 self.body.splice(self.compute)
@@ -1718,7 +1741,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         end_segment_loop() kept for it. Helion launches them as one kernel
         whose program ids run the first loop's tiles, then the next one's. For
         the partial statistics of DenseNet's BatchNorm over a cat of 64 + 5 *
-        32 channels, per image over its 3136 pixels:
+        32 channels, per image over its 3136 pixels, whose five loops over 32
+        channels share their blocks (shared_segment_blocks()):
+            block_y0 = hl.register_block_size(4)
+            ...
             for tile_y, tile_x in hl.tile([4, 64]):
                 acc = hl.zeros([tile_y, tile_x], dtype=torch.float32)
                 ...
@@ -1727,10 +1753,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                     ...
                 out1[tile_y, tile_x] = acc
                 ...
-            for tile_y, tile_x in hl.tile([4, 32]):
+            for tile_y, tile_x in hl.tile([4, 32], block_size=[block_y0, block_x0]):
                 acc3 = hl.zeros([tile_y, tile_x], dtype=torch.float32)
                 ...
-                for tile_r in hl.tile(3136):
+                for tile_r in hl.tile(3136, block_size=block_r0):
                     tmp69 = in7[tile_y, tile_x, tile_r].to(torch.float32)
                     ...
         and four more loops over [4, 32], where one loop over [4, 224] loaded
@@ -1738,16 +1764,70 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         assert self.axis_segments is not None
         segmented = self.axis_segments[0]
         tiles = ", ".join(TILE_NAMES[axis] for axis in self.outer_axes)
+
+        def extent(axis: str, length: int) -> object:
+            return length if axis == segmented else self.extents[axis]
+
+        shares = {
+            end - start: self.shared_segment_blocks(end - start)
+            for start, end, _ in self.segment_bodies
+        }
+        for length, shared in shares.items():
+            if not shared:
+                continue
+            for axis in self.outer_axes:
+                code.writeline(
+                    f"{shared[axis]} = hl.register_block_size({extent(axis, length)})"
+                )
+            for index in range(self.segment_passes.get(length, 0)):
+                name = shared_rdim_block(shared, index)
+                code.writeline(
+                    f"{name} = hl.register_block_size({self.extents['r0_']})"
+                )
         for start, end, body in self.segment_bodies:
             sizes = ", ".join(
-                str(end - start) if axis == segmented else str(self.extents[axis])
-                for axis in self.outer_axes
+                str(extent(axis, end - start)) for axis in self.outer_axes
             )
             sizes = sizes if len(self.outer_axes) == 1 else f"[{sizes}]"
+            shared = shares[end - start]
+            if shared:
+                names = [shared[axis] for axis in self.outer_axes]
+                blocks = names[0] if len(names) == 1 else f"[{', '.join(names)}]"
+                sizes = f"{sizes}, block_size={blocks}"
             code.writeline(f"for {tiles} in hl.tile({sizes}):")
             with code.indent():
                 self.codegen_rdim(code, TILE_NAMES[self.outer_axes[-1]])
                 code.splice(body)
+
+    def shared_segment_blocks(self, length: int) -> dict[str, str] | None:
+        """The names of the block sizes that the loops of the segments of
+        `length` share, by axis (the outer axes, and r0_ for their loops over
+        tile_r, whose passes shared_rdim_block() names), where two or more
+        segments of the segmented axis have that length and each has a loop of
+        its own (codegen_segment_loops()); else None. Loops of one shape tile
+        alike, and one config entry per block then serves them all:
+        DenseNet's BatchNorm statistics over a cat of 64 + 5 * 32 channels
+        share the five [4, 32] loops' blocks,
+            block_y0 = hl.register_block_size(4)
+            block_x0 = hl.register_block_size(32)
+            block_r0 = hl.register_block_size(3136)
+            for tile_y, tile_x in hl.tile([4, 64]):
+                ...
+            for tile_y, tile_x in hl.tile([4, 32], block_size=[block_y0, block_x0]):
+                ...
+                for tile_r in hl.tile(3136, block_size=block_r0):
+        Groups count in the order their lengths first appear."""
+        if not self.segment_loops or self.axis_segments is None:
+            return None
+        lengths = [end - start for start, end in self.axis_segments[1]]
+        repeated = [n for n in OrderedSet(lengths) if lengths.count(n) >= 2]
+        if length not in repeated:
+            return None
+        group = repeated.index(length)
+        return {
+            axis: f"block_{TILE_NAMES[axis].removeprefix('tile_')}{group}"
+            for axis in [*self.outer_axes, "r0_"]
+        }
 
     def codegen_rdim(self, code: IndentedBuffer, tile: str) -> None:
         """Define rdim (rdim_code()): for an rdim of more than UNROLLED_RDIM_MAX
@@ -2312,6 +2392,9 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.codegen_body()
         self.segment_bodies.append((start, end, self.body))
         self.body = IndentedBuffer()
+        passes = self.segment_passes.get(end - start, 0)
+        self.segment_passes[end - start] = max(passes, self.segment_pass)
+        self.segment_pass = 0
         # CSE.invalidate() is the way to drop the cached values; the stores it
         # marks invalidated would keep every buffer the next loop reads back
         # (must_keep_buffers): the welford's mean of a LayerNorm, which its

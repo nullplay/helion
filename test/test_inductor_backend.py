@@ -828,6 +828,21 @@ def check_unequal_cat_segment_loops(
     test.assertIn("for tile_y, tile_x in hl.tile([4, 32]):", source)
     test.assertEqual(source.count("for tile_r in hl.tile(3136):"), 2)
     test.assertRegex(source, r"in\d\[tile_y, tile_x, tile_r\]")
+    # Over 64 + 32 + 32 channels the two loops over 32 share their blocks
+    # (HelionKernel.shared_segment_blocks()); the loop over 64 keeps its own.
+    parts.append(torch.randn(4, 32, 56, 56, device=DEVICE, dtype=torch.bfloat16))
+    sources = test.compile(
+        lambda a, b, c: torch.var_mean(torch.cat([a, b, c], 1), [0, 2, 3]),
+        *parts,
+        tol=1e-2,
+        backend=backend,
+    )
+    (source,) = [s for s in sources if "hl.tile([4, 64])" in s]
+    test.assertIn("block_x0 = hl.register_block_size(32)", source)
+    test.assertEqual(
+        source.count("hl.tile([4, 32], block_size=[block_y0, block_x0])"), 2
+    )
+    test.assertEqual(source.count("hl.tile(3136, block_size=block_r0)"), 2)
     # Unsplit (training, running statistics updated in place) over a cat of
     # 16 + 8 channels: its rdim of N * H * W = 3136 per channel reads each
     # image's run through r // 784 and r % 784, so the parts' loops would
