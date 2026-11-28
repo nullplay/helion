@@ -332,3 +332,54 @@ def row_dot(x: torch.Tensor, xt: torch.Tensor) -> torch.Tensor:
             x[tile_m, :].to(torch.float32) * xt[tile_m, :].to(torch.float32), dim=-1
         )
     return out
+
+
+def scaled_copy_and_sum(
+    x: torch.Tensor, out: torch.Tensor, total: torch.Tensor
+) -> None:
+    """``out[y, r, c] = x[y, r, c] * 0.5`` and ``total[y, c] = sum_r x * 0.5``
+    with ``x`` contiguous along r and ``out`` along c (better-benchmark's
+    471fe712: a transposed scaled copy beside a sum over r).  Under
+    ``TRANSPOSED_SUM_CONFIG`` each thread runs eight blocked columns as a
+    lane loop around the r loop; jammed, the lanes' stores of one r address
+    eight consecutive elements of ``out``'s stride-1 dimension."""
+    batch, n_r, n_c = x.shape
+    for tile_y, tile_c in hl.tile([batch, n_c]):
+        acc = hl.zeros([tile_y, tile_c], dtype=torch.float32)
+        for tile_r in hl.tile(n_r):
+            v = x[tile_y, tile_r, tile_c].to(torch.float32) * 0.5
+            out[tile_y, tile_r, tile_c] = v.to(out.dtype)
+            acc = acc + torch.sum(v, -2)
+        total[tile_y, tile_c] = acc
+
+
+TRANSPOSED_SUM_CONFIG = {
+    # 32 columns on 4 threads of 8 blocked lanes each, r on 8 threads of 16.
+    "block_sizes": [1, 32, 128],
+    "num_threads": [1, 4, 8],
+    "cute_vector_widths": [1, 1, 16],
+    "cute_lane_layouts": ["blocked"] * 3,
+    "cute_cluster_n": 1,
+    "cute_pdl": False,
+}
+
+
+def transposed_sum_inputs(
+    batch: int,
+    n_c: int,
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    device: str | torch.device | None = None,
+    out_offset: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``scaled_copy_and_sum``'s arguments: x ``[batch, 128, n_c]`` stored
+    r-innermost, ``out`` contiguous along c (its storage shifted by
+    ``out_offset`` elements, a misaligned view when not a multiple of the
+    packet) and an fp32 ``total``, on ``device`` (torch's default when
+    None)."""
+    x = torch.randn(batch, n_c, 128, device=device, dtype=torch.float32).to(dtype)
+    x = x.transpose(1, 2)
+    storage = torch.empty(batch * 128 * n_c + out_offset, device=device, dtype=dtype)
+    out = storage[out_offset:].view(batch, 128, n_c)
+    total = torch.empty(batch, n_c, device=device, dtype=torch.float32)
+    return x, out, total

@@ -189,6 +189,12 @@ _LOAD_KINDS = frozenset(
     {"load", "arch_load", "packet", "hinted_packet", "masked_packet"}
 )
 _STORE_KINDS = frozenset({"store", "flush"})
+# The packet store of a run of the lanes' scalar stores, by the carrier its
+# elements bitcast to (``_vectorize_stores``).
+_PACKET_STORE_HELPERS = {
+    "cutlass.Uint16": "_cute_store_u16_vec",
+    "cutlass.Uint32": "_cute_store_u32_vec",
+}
 _LOOP_ITERATORS = frozenset({"range", "cutlass.range", "cutlass.range_constexpr"})
 _BARRIER = "cute.arch.sync_threads"
 _TWO_STAGE = ReduceScope.SHARED_TWO_STAGE.value
@@ -743,6 +749,7 @@ class _Jam:
         copies = [self._lane_copy(body, lane) for lane in range(self.extent)]
         jammed = self._merge(body, copies)
         self._vectorize_loads(jammed)
+        self._vectorize_stores(jammed)
         jammed = self._rewrite_groups(jammed, self._batched_reduce)
         if self.private_atomics:
             jammed = self._rewrite_groups(jammed, self._combined_atomic)
@@ -1592,53 +1599,15 @@ class _Jam:
         """Packet loads of the lanes' consecutive elements, one per run of
         lanes a packet holds (two four-element packets for eight fp32
         lanes), or None."""
-        pointers = []
+        loaded_pointers = []
         for call in calls:
             loaded = _load_pointer(match_packet_access(call))
             assert loaded is not None
-            pointer = _parse_pointer(loaded)
-            if pointer is None:
-                return None
-            pointers.append(pointer)
-        tensor_name = pointers[0].tensor
-        tensor = self.tensors.get(tensor_name)
-        if (
-            tensor is None
-            or tensor.dtype not in _CUTE_VECTOR_UNROLL_CARRIER
-            or self.extent & (self.extent - 1)
-        ):
+            loaded_pointers.append(loaded)
+        packet = self._lane_packet(loaded_pointers)
+        if packet is None:
             return None
-        width = min(self.extent, _CUTE_VECTOR_MAX_BYTES // tensor.dtype.itemsize)
-        if width < 2:
-            return None
-        lane_dims = [
-            (dim, name)
-            for dim, index in pointers[0].indices.items()
-            for name in self.consecutive
-            if ast.unparse(_strip_int32(index)) == self._lane_name(name, 0)
-        ]
-        if len(lane_dims) != 1:
-            return None
-        ((dim, name),) = lane_dims
-        if tensor.stride(dim) != 1:
-            return None
-        for lane, pointer in enumerate(pointers):
-            if (
-                pointer.tensor != tensor_name
-                or pointer.indices.keys() != pointers[0].indices.keys()
-            ):
-                return None
-            for other, index in pointer.indices.items():
-                if other == dim:
-                    if ast.unparse(_strip_int32(index)) != self._lane_name(name, lane):
-                        return None
-                elif ast.unparse(index) != ast.unparse(pointers[0].indices[other]):
-                    return None
-        if not (
-            self._multiple_of(self.lane_base, width)
-            and cute_reduction_vector_layout_aligned(self.env, tensor, dim, width)
-        ):
-            return None
+        tensor, width = packet
         first = calls[0]
         first_access = match_packet_access(first)
         # The scalar loads' cache hint carries over to the packet.
@@ -1656,15 +1625,150 @@ class _Jam:
         vector_vars: list[str] = []
         statements: list[ast.stmt] = []
         for start in range(0, self.extent, width):
-            loaded = _load_pointer(match_packet_access(calls[start]))
-            assert loaded is not None
             vector_var = self.new_var("_jam_vec")
             load = _cute_unroll_vec_load_expr(
-                ast.unparse(loaded), tensor.dtype, width, suffix
+                ast.unparse(loaded_pointers[start]), tensor.dtype, width, suffix
             )
             vector_vars.append(vector_var)
             statements.append(statement_from_string(f"{vector_var} = {load}"))
         return vector_vars, statements, tensor.dtype
+
+    def _lane_packet(
+        self, pointers: Sequence[ast.expr]
+    ) -> tuple[torch.Tensor, int] | None:
+        """``(tensor, width)`` when the lanes' copies of one access address
+        ``pointers``, in lane order, are runs of ``width`` lanes that one
+        aligned packet of ``tensor`` holds: the lanes' consecutive indices
+        (``consecutive``) on one dimension of stride 1, every other index the
+        same, a lane base that is a multiple of the width, and
+        ``cute_reduction_vector_layout_aligned`` (the base aligned to the
+        packet's bytes, every other stride a multiple of the width).  None
+        else.  The loads' and the stores' packets share this proof."""
+        parsed: list[_Pointer] = []
+        for pointer in pointers:
+            lane_pointer = _parse_pointer(pointer)
+            if lane_pointer is None:
+                return None
+            parsed.append(lane_pointer)
+        tensor_name = parsed[0].tensor
+        tensor = self.tensors.get(tensor_name)
+        if (
+            tensor is None
+            or tensor.dtype not in _CUTE_VECTOR_UNROLL_CARRIER
+            or self.extent & (self.extent - 1)
+        ):
+            return None
+        width = min(self.extent, _CUTE_VECTOR_MAX_BYTES // tensor.dtype.itemsize)
+        if width < 2:
+            return None
+        lane_dims = [
+            (dim, name)
+            for dim, index in parsed[0].indices.items()
+            for name in self.consecutive
+            if ast.unparse(_strip_int32(index)) == self._lane_name(name, 0)
+        ]
+        if len(lane_dims) != 1:
+            return None
+        ((dim, name),) = lane_dims
+        if tensor.stride(dim) != 1:
+            return None
+        for lane, pointer in enumerate(parsed):
+            if (
+                pointer.tensor != tensor_name
+                or pointer.indices.keys() != parsed[0].indices.keys()
+            ):
+                return None
+            for other, index in pointer.indices.items():
+                if other == dim:
+                    if ast.unparse(_strip_int32(index)) != self._lane_name(name, lane):
+                        return None
+                elif ast.unparse(index) != ast.unparse(parsed[0].indices[other]):
+                    return None
+        if not (
+            self._multiple_of(self.lane_base, width)
+            and cute_reduction_vector_layout_aligned(self.env, tensor, dim, width)
+        ):
+            return None
+        return tensor, width
+
+    def _vectorize_stores(self, stmts: list[ast.stmt]) -> None:
+        """Replace each run of the lanes' copies of an unconditional scalar
+        store into the lanes' consecutive elements of a stride-1 dimension by
+        packet stores, one per run of lanes a packet holds.
+
+        A reduction that loads a tile contiguous along r and stores it
+        contiguous along the lane axis x (better-benchmark's 471fe712:
+        ``out0[y, r, x] = in0[y, r, x] * c`` beside the sum over r) jams
+        eight blocked x lanes into its r loop, and the lanes' stores of one r
+        then sit side by side::
+
+            (out0.iterator + ... + Int32(indices_1_lane0) * ...).store(v_lane0)
+            ...
+            (out0.iterator + ... + Int32(indices_1_lane7) * ...).store(v_lane7)
+
+        Eight 2-byte stores, a warp's store writing 2 bytes every 16: that
+        jammed config took 60.9 us where its unjammed search took 16-17, so
+        no search kept the jam.  The run becomes one 16-byte packet::
+
+            _cute_store_u16_vec(
+                out0.iterator + ... + Int32(indices_1_lane0) * ...,
+                [cutlass.BFloat16(v_lane0).bitcast(cutlass.Uint16), ...],
+            )
+
+        The packet stores the same bytes to the same addresses: the jam has
+        proved the lanes' stores disjoint and free to reorder
+        (``_check_memory``), and the run is adjacent, so nothing observes an
+        order between its stores.  A store under a branch that every lane
+        takes alike (one the merge keeps whole) is a run like any other; one
+        under a per-lane branch is no adjacent run of copies and stays
+        scalar."""
+        position = 0
+        while position < len(stmts):
+            stmt = stmts[position]
+            for field in ("body", "orelse"):
+                inner = getattr(stmt, field, None)
+                if isinstance(inner, list):
+                    self._vectorize_stores(inner)
+            group = self._group_at(stmts, position)
+            if group is None:
+                position += 1
+                continue
+            packets = self._vector_store(group)
+            if packets is None:
+                position += len(group)
+                continue
+            stmts[position : position + len(group)] = packets
+            position += len(packets)
+
+    def _vector_store(self, group: Sequence[ast.stmt]) -> list[ast.stmt] | None:
+        """Packet stores of the lanes' copies ``group`` of one scalar store,
+        one per run of lanes a packet holds (``_lane_packet``), or None."""
+        accesses: list[PacketAccess] = []
+        for part in group:
+            if not isinstance(part, ast.Expr) or not isinstance(part.value, ast.Call):
+                return None
+            access = match_packet_access(part.value)
+            if access is None or access.kind != "store":
+                return None
+            accesses.append(access)
+        packet = self._lane_packet([access.pointer for access in accesses])
+        if packet is None:
+            return None
+        tensor, width = packet
+        carrier = _CUTE_VECTOR_UNROLL_CARRIER[tensor.dtype]
+        helper = _PACKET_STORE_HELPERS[carrier]
+        element = _CUTE_VECTOR_UNROLL_DTYPES[tensor.dtype]
+        packets: list[ast.stmt] = []
+        for start in range(0, self.extent, width):
+            values = ", ".join(
+                f"{element}({ast.unparse(access.call.args[0])}).bitcast({carrier})"
+                for access in accesses[start : start + width]
+            )
+            pointer_text = ast.unparse(accesses[start].pointer)
+            packets.append(
+                statement_from_string(f"{helper}({pointer_text}, [{values}])")
+            )
+        return packets
 
     def _lane_name(self, name: str, lane: int) -> str:
         return self.lane_names[lane][name]

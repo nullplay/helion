@@ -34,6 +34,7 @@ from helion._testing.cute_grid_lane_jam_kernels import HEAD_ROWS_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import ROW_NORM_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import SCALAR_ROWS_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import SCATTER_CONFIG
+from helion._testing.cute_grid_lane_jam_kernels import TRANSPOSED_SUM_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import bias_softmax
 from helion._testing.cute_grid_lane_jam_kernels import bucket_grad_scatter
 from helion._testing.cute_grid_lane_jam_kernels import bucket_grad_scatter_twice
@@ -51,6 +52,8 @@ from helion._testing.cute_grid_lane_jam_kernels import row_dot
 from helion._testing.cute_grid_lane_jam_kernels import row_norm
 from helion._testing.cute_grid_lane_jam_kernels import rows_into_two
 from helion._testing.cute_grid_lane_jam_kernels import scale_rows_in_place
+from helion._testing.cute_grid_lane_jam_kernels import scaled_copy_and_sum
+from helion._testing.cute_grid_lane_jam_kernels import transposed_sum_inputs
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
@@ -1448,3 +1451,70 @@ def test_privatized_adds_combine_under_another_addend_keyword() -> None:
     assert _private_adds(code) == list(range(8))
     assert "value=_jam_add" in code
     assert "val=" not in code
+
+
+def _transposed_sum_code(
+    n_c: int = 64,
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    jam: bool = True,
+    out_offset: int = 0,
+) -> str:
+    """``scaled_copy_and_sum`` over ``[2, 128, n_c]``, rendered on CPU at
+    ``TRANSPOSED_SUM_CONFIG``: eight blocked column lanes around the r loop."""
+    kernel = helion.kernel(
+        scaled_copy_and_sum, backend="cute", static_shapes=True, autotune_effort="none"
+    )
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        args = transposed_sum_inputs(2, n_c, dtype, out_offset=out_offset)
+        bound = cpu_bind(kernel, args)
+        return bound.to_code(
+            helion.Config(**TRANSPOSED_SUM_CONFIG, cute_grid_lane_jam=jam)
+        )
+
+
+def test_jam_stores_the_column_lanes_of_one_r_as_a_packet() -> None:
+    # Jammed, the eight column lanes' bf16 stores of one r address eight
+    # consecutive elements of out's stride-1 dimension: one 16-byte packet
+    # (inside the r vector loop), and the fp32 sums two packets of four.
+    code = _transposed_sum_code()
+    assert "for lane_1 in range(" not in code
+    assert code.count("_cute_store_u16_vec(") == 1
+    assert code.count("_cute_store_u32_vec(") == 2
+    assert ").store(" not in code
+    # The packet is lane 0's address with the lanes' values in lane order.
+    (packet,) = [line for line in code.splitlines() if "_cute_store_u16_vec(" in line]
+    assert "indices_1_lane0" in packet
+    assert "indices_1_lane1" not in packet
+    assert all(f"_lane{lane})" in packet for lane in range(8))
+    # Knob off: the rolled lane loop and its scalar stores.
+    rolled = _transposed_sum_code(jam=False)
+    assert "for lane_1 in range(8)" in rolled
+    assert "_cute_store_u16_vec(" not in rolled
+    assert ").store(" in rolled
+
+
+def test_fp32_column_lanes_store_two_packets_of_four() -> None:
+    code = _transposed_sum_code(dtype=torch.float32)
+    # 32 bytes of eight fp32 lanes: two 16-byte packets per r, two for the sums.
+    assert code.count("_cute_store_u32_vec(") == 4
+    assert ").store(" not in code
+
+
+def test_a_misaligned_view_keeps_scalar_stores() -> None:
+    # out one element into its storage: lane 0's address is 2 bytes past a
+    # 16-byte boundary, so no packet; the aligned sums still take theirs.
+    code = _transposed_sum_code(out_offset=1)
+    assert "_cute_store_u16_vec(" not in code
+    assert code.count(").store(") == 8
+    assert code.count("_cute_store_u32_vec(") == 2
+
+
+@pytest.mark.parametrize("n_c", [36, 40])
+def test_a_column_tail_keeps_the_rolled_lanes(n_c: int) -> None:
+    # 36 or 40 columns leave the last tile's lanes partly out of bounds: the
+    # lanes are guarded, the jam declines, and every store stays scalar.
+    code = _transposed_sum_code(n_c=n_c)
+    assert "for lane_1 in range(8)" in code
+    assert "_cute_store_u16_vec(" not in code
+    assert ").store(" in code
