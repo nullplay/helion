@@ -13,6 +13,7 @@ from torch._inductor.ir import FixedLayout
 from torch._inductor.ir import InputBuffer
 from torch._inductor.utils import sympy_index_symbol
 from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import FloorDiv
 from torch.utils._sympy.functions import ModularIndexing
 from torch.utils._sympy.value_ranges import ValueRanges
@@ -477,6 +478,130 @@ class TestSpanSubscript(TestCase):
             "[(-256) + tile_y.index + 256*tile_z.index.reshape([tile_z, 1]), tile_x]",
             unknown,
         )
+
+
+class TestAxisSplit(TestCase):
+    """HelionKernel.axis_split() and split_axis(): a pointwise axis that the
+    kernel's indices no view reads divide, or take modulo, by one size K that
+    divides its extent is tiled as extent / K by K, over which they are
+    affine."""
+
+    def split(self, sizes, *indices, loads=(), cuts=(), then=None):
+        """The split axis_split() takes after the kernel over `sizes` saw the
+        stores' `indices` and the `loads`' (note_axis_divisors()), with `cuts`
+        axes that segments cut; and `then` over the tile indices once
+        split_axis() took it."""
+        graph = GraphLowering(torch.fx.symbolic_trace(lambda x: x + 1))
+        with V.set_graph_handler(graph):
+            total = 1
+            for size in sizes.values():
+                total *= size
+            kernel = HelionKernel(
+                sizes,
+                features=SIMDKernelFeatures([], sympy.Integer(total), sympy.Integer(1)),
+            )
+            for axis in cuts:
+                kernel.axis_cuts[axis] = OrderedSet([1])
+            with V.set_kernel_handler(kernel):
+                for index in indices:
+                    kernel.note_axis_divisors(index(**kernel.symbols), True)
+                for index in loads:
+                    kernel.note_axis_divisors(index(**kernel.symbols), False)
+                found = kernel.axis_split()
+                if found is None or then is None:
+                    return found, None
+                symbols = dict(kernel.symbols)
+                kernel.split_axis(*found)
+                index = kernel.tile_index(then(**symbols))
+                axes = kernel.outer_axes
+                extents = [kernel.extents[axis] for axis in axes]
+                # The index over tile_w (w) and the other tiles, by axis.
+                names = {kernel.symbols[axis]: axis.rstrip("0_") for axis in axes}
+                return found, (
+                    str(
+                        index.xreplace(
+                            {
+                                symbol: sympy.Symbol(name)
+                                for symbol, name in names.items()
+                            }
+                        )
+                    ),
+                    axes,
+                    extents,
+                )
+
+    def test_unfold(self):
+        # MobileViT's unfold, a cat of three trimmed [512, 4, 256, 40] parts
+        # copied to [512, 256, 3, 4, 36]: the store divides y of 1024 by 256
+        # and takes it modulo 256, so y is tiled as tile_w of 4 by tile_y of
+        # 256, over which the store and the load are affine.
+        store = lambda z0_, y, x: (  # noqa: E731
+            x + 36 * FloorDiv(y, 256) + 432 * ModularIndexing(y, 1, 256) + 110592 * z0_
+        )
+        load = lambda z0_, y, x: x + 40 * y + 40960 * z0_  # noqa: E731
+        found, split = self.split(
+            {"z0_": 512, "y": 1024, "x": 36}, store, loads=[load], then=store
+        )
+        self.assertEqual(found, ("y", 256))
+        self.assertEqual(
+            split,
+            (
+                "36*w + x + 432*y + 110592*z",
+                ("z0_", "w_", "y", "x"),
+                [512, 4, 256, 36],
+            ),
+        )
+        # The load: 40 * y is 10240 * tile_w + 40 * tile_y.
+        _, split = self.split({"z0_": 512, "y": 1024, "x": 36}, store, then=load)
+        self.assertEqual(split[0], "10240*w + x + 40*y + 40960*z")
+
+    def test_declines(self):
+        sizes = {"y": 1024, "x": 36}
+        # Two sizes of one axis: no split makes both affine.
+        two = lambda y, x: FloorDiv(y, 256) + ModularIndexing(y, 1, 128)  # noqa: E731
+        self.assertIsNone(self.split(sizes, two)[0])
+        # A size that does not divide the extent.
+        self.assertIsNone(self.split(sizes, lambda y, x: FloorDiv(y, 300))[0])
+        # Two outer axes, each divided: one split at most.
+        both = lambda z0_, y, x: FloorDiv(y, 256) + 7 * ModularIndexing(z0_, 1, 4)  # noqa: E731
+        self.assertIsNone(self.split({"z0_": 64, **sizes}, both)[0])
+        # The innermost axis stays whole: split, its tile would hold runs of
+        # 256 elements instead of the axis's whole runs.
+        inner = lambda y, x: FloorDiv(x, 256) + 7 * ModularIndexing(x, 1, 256)  # noqa: E731
+        self.assertIsNone(self.split({"y": 36, "x": 1024}, inner)[0])
+        # Nor does an outer axis split beside it: the innermost axis's
+        # accesses would stay flat.
+        outer = lambda y, x: FloorDiv(y, 256) + 7 * ModularIndexing(x, 1, 4)  # noqa: E731
+        self.assertIsNone(self.split(sizes, outer)[0])
+        # An axis the segments cut, which they make affine.
+        self.assertIsNone(
+            self.split(sizes, lambda y, x: FloorDiv(y, 256), cuts=["y"])[0]
+        )
+        # A size of the whole extent divides nothing: y // 1024 is 0.
+        whole = lambda y, x: FloorDiv(y, 1024) + FloorDiv(y, 256)  # noqa: E731
+        self.assertEqual(self.split(sizes, whole)[0], ("y", 256))
+
+    def test_loads_alone_do_not_split(self):
+        # A broadcast copy of [2048, 12, 257] to [8, 256, 12, 257] (G02's
+        # sum_7ba9dcb96142_39dafa96): the load reads in0[x + 257*(z % 256)],
+        # the store is a tile store. Split, only the load would turn into a
+        # tile, and the graph's other kernels drew slower configs (x0.944 of
+        # its helion time); a store's index must divide the axis.
+        sizes = {"z0_": 2048, "y": 12, "x": 257}
+        load = lambda z0_, y, x: x + 257 * ModularIndexing(z0_, 1, 256)  # noqa: E731
+        store = lambda z0_, y, x: x + 257 * y + 3084 * z0_  # noqa: E731
+        self.assertIsNone(self.split(sizes, store, loads=[load])[0])
+        # Two loads dividing y of 768 by 256 (a Longformer band copy), with
+        # tile stores: no split either.
+
+        def band(y, x):
+            return x + 513 * FloorDiv(y, 256) + 2052 * ModularIndexing(y, 1, 256)
+
+        self.assertIsNone(
+            self.split({"y": 768, "x": 513}, lambda y, x: x + 513 * y, loads=[band])[0]
+        )
+        # The same division in a store splits.
+        self.assertEqual(self.split(sizes, load, loads=[store])[0], ("z0_", 256))
 
 
 class TestPersistentLoad(TestCase):

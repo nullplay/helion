@@ -525,18 +525,30 @@ class HelionScheduling(SIMDScheduling):
         kernel = HelionKernel(*kernel_args, **kernel_kwargs)
         if kernel.mix_order_reduction:
             return [kernel]
-        # Only a node with a masked part (a cat's or pad's ops.masked()) can
-        # cut an axis (HelionKernel.pointwise_segments()) or, trailing a
-        # persistent reduction, its rdim (rdim_segments()) into segments.
+        # A comparison of an index with an integer cuts an axis into segments
+        # (HelionKernel.note_axis_cut(), pointwise_segments()) or, trailing a
+        # persistent reduction, its rdim (rdim_segments()): a cat's or pad's
+        # ops.masked() compares so, and so may any member (a where over an
+        # iota). The probe that finds the cuts runs for a kernel with a
+        # masked part, and for a pointwise kernel of three tile axes, which it
+        # probes for axis_split() anyway.
         masked = any(
             isinstance(node, SchedulerNode) and node._body.subblocks
             for node in kernel_features.node_schedule
         )
         if not kernel.persistent_reduction:
-            if not masked or kernel.rolled_reduction():
+            # A pointwise kernel of three tile axes, all natural_tiling() tiles,
+            # may have joined two dims into one that an index no view reads
+            # divides again (HelionKernel.axis_split()); the probe tells.
+            pointwise = not kernel_features.is_reduction()
+            wide = pointwise and len(kernel.outer_axes) >= 3
+            if not (masked or wide) or kernel.rolled_reduction():
                 return [kernel]
             self.probe(kernel_features, kernel)
-            return [self.with_pointwise_segments(kernel, kernel_args, kernel_kwargs)]
+            final = self.with_pointwise_segments(kernel, kernel_args, kernel_kwargs)
+            if pointwise and (split := kernel.axis_split()) is not None:
+                final.split_axis(*split)
+            return [final]
         # One block holds one run where the runs are a tile (HelionKernel.runs).
         long_rdim = "override_persistent_reduction" not in kernel_kwargs and (
             V.graph.sizevars.statically_known_gt(

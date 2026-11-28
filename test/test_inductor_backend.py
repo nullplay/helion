@@ -832,6 +832,40 @@ def check_window_spans(test: InductorBackendTestCase, backend: str) -> None:
     test.assertRegex(window, r"tmp\d+ = in\d\[[^\n]*%[^\n]*, tile_x\]")
 
 
+def check_split_axis(test: InductorBackendTestCase, backend: str) -> None:
+    """MobileViT's unfold at a small shape: a cat of three [16, 4, 16, 40] bf16
+    parts trimmed to 36 and copied to [16, 16, 3, 4, 36], beside a float sum
+    over its first dim. The copy's y of 64 = 16 * k + s, which the stores
+    divide by 16 and take modulo 16, is tiled as tile_w of 4 by tile_y of 16
+    (HelionKernel.split_axis()): every load and store of it is a view. With
+    float32 parts transposed in their last two dims, the stores divide x of
+    576 = 16 * d + s instead, which stays whole as the innermost axis."""
+    for dtype, transposed in ((torch.bfloat16, False), (torch.float32, True)):
+        parts = [
+            torch.randn(16, 4, 40, 16, device=DEVICE, dtype=dtype).transpose(2, 3)
+            if transposed
+            else torch.randn(16, 4, 16, 40, device=DEVICE, dtype=dtype)
+            for _ in range(3)
+        ]
+
+        def unfold(a, b, c):
+            cat = torch.cat([F.pad(p, (0, -4)) for p in (c, b, a)])
+            out = cat.view(3, 16, 4, 16, 36).permute(1, 3, 0, 2, 4).contiguous()
+            return out.view(256, 432), out.view(256, 432).float().sum(0)
+
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        sources = test.compile(unfold, *parts, tol=tol, backend=backend)
+        split = [source for source in sources if "tile_w" in source]
+        if transposed:
+            test.assertEqual(split, [])
+            continue
+        (copy,) = split
+        test.assertIn(
+            "for tile_z, tile_w, tile_y, tile_x in hl.tile([16, 4, 16, 36]):", copy
+        )
+        test.assertNotIn("//", copy)
+
+
 # The CuTe lane, where CuTe DSL is installed, runs this.
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
@@ -1280,6 +1314,9 @@ class TestInductorCute(InductorBackendTestCase):
 
     def test_window_spans(self):
         check_window_spans(self, "cute")
+
+    def test_split_axis(self):
+        check_split_axis(self, "cute")
 
     @looped
     def test_welford(self):
@@ -3613,6 +3650,9 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
 
     def test_window_spans(self):
         check_window_spans(self, "triton")
+
+    def test_split_axis(self):
+        check_split_axis(self, "triton")
 
     def test_long_rdims_join_dims_split_by_r_invariant_reads(self):
         # An rdim of 2048 over (y, x) = [4, 16], with an r-invariant value of
