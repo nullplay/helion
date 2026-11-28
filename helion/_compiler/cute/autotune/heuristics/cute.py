@@ -4471,20 +4471,22 @@ class CuteRowRunsHeuristic(AutotunerHeuristic):
     tensor.
 
     helion.inductor reads a BatchNorm's rdim, N runs of H * W contiguous
-    elements per channel, as one load per run over a persistent run,
-    ``x[tile, 0, :]`` through ``x[tile, N - 1, :]``, and adds the runs'
-    values before each reduction (its unrolled runs).  The default persistent
-    row (``reduction_loops`` None) of a run that is no power of two renders
-    as one warp of scalar lanes, and no other heuristic seeds a vector layout
-    for it.  One loop chunk of the run's power of two with a packet per
-    thread reads every run in vector loads instead, and the runs stay in
-    registers through the statistics.  better-benchmark's
-    var_mean_0c1c9fc832f4_f584d38d (training BatchNorm over an NCHW
-    [16, 128, 28, 28] bf16, 16 runs of 784 per channel, in-place running
-    statistics) runs best with a chunk of 1024 over 256 threads of 4
-    elements, and 0c1c9fc832f4_56f0f473 (8 runs of 784 over 512 channels)
-    over 128 threads of 8: which packet wins depends on the runs and the
-    channels, so every packet width is a seed.
+    elements per channel that split 16-byte packets, as one load per run
+    over a persistent run, ``x[tile, 0, :]`` through ``x[tile, N - 1, :]``,
+    and adds the runs' values before each reduction (its unrolled runs).
+    The default persistent row (``reduction_loops`` None) of a run that is
+    no power of two renders as one warp of scalar lanes, and no other
+    heuristic seeds a vector layout for it.  One loop chunk of the run's
+    power of two with a packet per thread reads every run in vector loads
+    instead, and the runs stay in registers through the statistics.  The
+    unrolled runs of
+    better-benchmark's var_mean_0c1c9fc832f4_f584d38d (training BatchNorm
+    over an NCHW [16, 128, 28, 28] bf16, 16 runs of 784 per channel,
+    in-place running statistics; helion.inductor now reads such runs of
+    whole packets flat) ran best with a chunk of 1024 over 256 threads of 4
+    elements, and those of 0c1c9fc832f4_56f0f473 (8 runs of 784 over 512
+    channels) over 128 threads of 8: which packet wins depends on the runs
+    and the channels, so every packet width is a seed.
 
     Seeds: a grid tile of 1 on every grid axis (one row per CTA), the run's
     power of two as one chunk, a thread per packet for packets of 16 bytes

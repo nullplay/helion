@@ -1269,10 +1269,11 @@ class HelionChoices(InductorChoices):
         var_mean over at most UNROLL_RUNS_MAX runs whose statistics normalize
         its input (normalized_by()), a BatchNorm in training, and not over a
         cat or a pad (reads_masked_parts()): its persistent kernel reads each
-        run as a load of its own (unroll_runs()), as for an NCHW [16, 128,
-        28, 28] bf16 with its running statistics (better-benchmark's
-        var_mean_0c1c9fc832f4_f584d38d), which ran faster than the layout
-        split's three kernels (GB300)."""
+        run as a load of its own (unroll_runs()), or its flat rdim where the
+        runs are whole packets that one trip keeps (flat_packet_runs()), as
+        for an NCHW [16, 128, 28, 28] bf16 with its running statistics
+        (better-benchmark's var_mean_0c1c9fc832f4_f584d38d), which ran faster
+        than the layout split's three kernels (GB300)."""
         node = V.graph.current_node
         if node is None or not isinstance(node.target, torch._ops.OpOverload):
             return False
@@ -1280,10 +1281,11 @@ class HelionChoices(InductorChoices):
             # Under the CuTe backend, a var_mean over at most UNROLL_RUNS_MAX
             # runs whose input its statistics normalize: its kernel, which
             # reads the rdim again, is persistent and unrolls the runs
-            # (unroll_runs()). One that only reduces loops over the rdim,
-            # which HelionKernel.rdim_runs() reads flat, and one over a cat or
-            # a pad, whose runs it does not unroll (masked_parts()): the
-            # layout split pays for them.
+            # (unroll_runs()) or reads them flat (flat_packet_runs()). One
+            # that only reduces loops over the rdim, which
+            # HelionKernel.rdim_runs() reads flat, and one over a cat or a pad,
+            # whose runs it does not unroll (masked_parts()): the layout split
+            # pays for them.
             return (
                 config.backend == "cute"
                 and runs <= UNROLL_RUNS_MAX
