@@ -29,6 +29,7 @@ from helion._compiler.cute.autotune.heuristics.cute import CuteRolledRowLadderHe
 from helion._compiler.cute.autotune.heuristics.cute import (
     CuteRolledRowLoadsFirstHeuristic,
 )
+from helion._compiler.cute.autotune.heuristics.cute import CuteRowRunsHeuristic
 from helion._compiler.cute.autotune.heuristics.cute import CuteSegmentRootRowHeuristic
 from helion._compiler.cute.autotune.heuristics.cute import _is_sole_row_reduction
 from helion._compiler.cute.autotune.heuristics.cute import _row_tile_axes
@@ -67,6 +68,7 @@ from helion._testing.cute_row_seed_kernels import two_part_row_means
 from helion._testing.cute_row_seed_kernels import two_row_norms_in_swapped_tile_orders
 from helion._testing.cute_row_seed_kernels import two_row_norms_over_tiles_of_their_own
 from helion._testing.cute_row_seed_kernels import two_row_norms_sharing_a_block_size
+from helion._testing.cute_row_seed_kernels import two_run_row_norm
 from helion.runtime.config import Config
 
 if TYPE_CHECKING:
@@ -763,3 +765,49 @@ def test_segment_roots_share_one_row_config() -> None:
     assert found == [({2048}, {256}), ({4096}, {512})]
     unequal = _bind(two_part_row_means, (64, 3136), (32, 1000))
     assert not _seeds(CuteSegmentRootRowHeuristic, unequal)
+
+
+def test_a_row_of_runs_takes_one_chunk_of_packets() -> None:
+    """A persistent row of two runs of 784 bf16 elements, one load per run
+    (the kernel helion.inductor emits for a BatchNorm over two images): one
+    row per CTA and the run rounded to one chunk of 1024, over 128, 256 and
+    512 threads of 8, 4 and 2 elements, and every seed renders. A row of
+    one run gets none, and so do runs of 16, whose chunk fills no 32
+    threads of 2."""
+    bound = _bind(two_run_row_norm, (64, 2, 784), (64,))
+    seeds = _seeds(CuteRowRunsHeuristic, bound)
+    spec = bound.config_spec
+    (rdim,) = spec.reduction_loops.valid_block_ids()
+    found = []
+    for seed in seeds:
+        threads = dict(
+            zip(
+                (item.block_id for item in spec.num_threads),
+                seed.num_threads,
+                strict=True,
+            )
+        )
+        widths = dict(
+            zip(
+                (item.block_id for item in spec.cute_vector_widths),
+                seed.config["cute_vector_widths"],
+                strict=True,
+            )
+        )
+        found.append(
+            (seed.block_sizes, seed.reduction_loops, threads[rdim], widths[rdim])
+        )
+        with patch(
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
+            return_value=227 * 1024,
+        ):
+            assert _refusal(bound, seed) is None
+    assert found == [
+        ([1], [1024], 128, 8),
+        ([1], [1024], 256, 4),
+        ([1], [1024], 512, 2),
+    ]
+    one_run = _bind(row_norm_with_running_mean, (64, 784), (64,))
+    assert not _seeds(CuteRowRunsHeuristic, one_run)
+    short = _bind(two_run_row_norm, (64, 2, 16), (64,))
+    assert not _seeds(CuteRowRunsHeuristic, short)

@@ -137,6 +137,7 @@ from .cute import CuteResidentRowWideClusterHeuristic
 from .cute import CuteRolledClusterLadderHeuristic
 from .cute import CuteRolledRowLadderHeuristic
 from .cute import CuteRolledRowLoadsFirstHeuristic
+from .cute import CuteRowRunsHeuristic
 from .cute import CuteScanTileHeuristic
 from .cute import CuteSegmentRootRowHeuristic
 from .cute import CuteSiblingRowHeuristic
@@ -341,6 +342,7 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteTransposedStoreSeedsHeuristic,
     CuteLaneCarryRowHeuristic,
     CuteSegmentRootRowHeuristic,
+    CuteRowRunsHeuristic,
 )
 
 
