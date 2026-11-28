@@ -606,8 +606,9 @@ these labelled lines.
   over, a var_mean that only reduces, a split reduction's first kernel),
   every backend; worst at small rdim blocks, as the CuTe default config's 16.
   Not the reductions whose layout split HelionChoices declines although
-  they read enough values to take it (`UNSPLIT_LAYOUT`,
-  `HelionKernel.merges_carry()`), whose merges carry their rounding.
+  they read enough values to take it (`UNSPLIT_LAYOUT`), nor `flat_runs`
+  loops (runs of whole packets read flat): `HelionKernel.merges_carry()`
+  carries their merges' rounding.
 - What is wrong: each block's (mean, m2, weight) merges into the running
   mean as `acc + delta * share` and into the running m2 as
   `acc_m2 + m2 + delta * delta * acc_weight * share`, each of which rounds

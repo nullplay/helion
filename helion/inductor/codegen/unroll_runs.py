@@ -3,11 +3,11 @@
 A kernel that reads its rdim as Q runs of W elements (HelionKernel.rdim_runs())
 tiles the runs as one block of an outer loop, tile_q, beside one run of the
 rdim, and reduces each value over the run, then over the runs. A BatchNorm in
-training over an NCHW [16, 128, 28, 28] bf16 (better-benchmark's
-var_mean_0c1c9fc832f4_f584d38d), 16 runs of 784 per channel, with its running
+training over an NCHW [16, 256, 14, 14] bf16 (better-benchmark's
+var_mean_0c1c9fc832f4_b2063b0a), 16 runs of 196 per channel, with its running
 statistics updated in place:
 
-    for tile_x, tile_q in hl.tile([128, 16], block_size=[None, 16]):
+    for tile_x, tile_q in hl.tile([256, 16], block_size=[None, 16]):
         tmp0 = in0[tile_x, tile_q, :].to(torch.float32)
         ...
         tmp5 = torch.sum(tmp4, -1)
@@ -23,7 +23,7 @@ where the barrier ordering them cannot be placed". unroll_runs() writes it
 with one value per run instead, and adds the runs' values elementwise before
 one reduction over the run:
 
-    for tile_x in hl.tile(128):
+    for tile_x in hl.tile(256):
         tmp0_0 = in0[tile_x, 0, :].to(torch.float32)
         ...
         tmp0_15 = in0[tile_x, 15, :].to(torch.float32)

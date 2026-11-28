@@ -20,6 +20,8 @@ from torch._inductor.codegen.common import TensorArg
 from torch._inductor.codegen.simd import PartialAccumulate
 from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.codegen.simd import constant_repr
+from torch._inductor.dependencies import MemoryDep
+from torch._inductor.dependencies import extract_read_writes
 from torch._inductor.dtype_propagation import DtypePropagationOpsHandler
 from torch._inductor.ir import FixedLayout
 from torch._inductor.ir import IRNode
@@ -62,6 +64,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Iterator
+    from collections.abc import Mapping
     from collections.abc import Sequence
     from typing_extensions import Self
 
@@ -419,7 +422,7 @@ SEGMENT_LOOPS_MAX = 8
 # The most runs of a persistent Welford that HelionKernel.rdim_runs() reads by
 # runs and unrolls into one load per run (unroll_runs()): a BatchNorm over up
 # to 16 images. Each run is as many copies of every statement that reads it,
-# and as many values held per thread: 16 runs of 784 bf16 elements over 256
+# and as many values held per thread: 16 runs of 196 bf16 elements over 64
 # threads of 4 lanes keep 64 values of each tensor a thread reads.
 UNROLL_RUNS_MAX = 16
 
@@ -435,6 +438,104 @@ def masked_parts(node_schedule: list[Any]) -> bool:
         isinstance(node, SchedulerNode) and node._body.subblocks
         for node in node_schedule
     )
+
+
+def packet_runs(node_schedule: list[Any], run: int) -> bool:
+    """Whether a run of `run` elements is a whole number of 16-byte packets of
+    every buffer the kernel reads or writes: each image's run of 784 bf16
+    elements of an NCHW [16, 128, 28, 28] (98 packets). Its flat rdim then
+    moves every run in whole packets, as the CuTe backend proves 8 lanes
+    share r // 784 (784 % 8 == 0),
+        for tile_r in hl.tile(12544):
+            tmp0 = in0[784*tile_x.index.reshape([tile_x, 1])
+                + 100352*(tile_r.index // 784) + ((tile_r.index % 784))]
+    and that kernel, a BatchNorm with its running statistics
+    (better-benchmark's var_mean_0c1c9fc832f4_f584d38d), ran faster than
+    the one whose runs unroll into a load each (unroll_runs()) on a GB300,
+    each from a cold full search: 4.3 against 4.7 us (6.0 against 6.7 over
+    8 images of 512 channels). Runs of 196 or 49 bf16 elements split
+    packets, which the flat rdim then reads in narrower loads or element by
+    element: 1.8-2.6x slower than the unrolled runs at the vector width of
+    their packets, each form at its best configuration found."""
+    sizes = {
+        V.graph.get_dtype(dep.name).itemsize
+        for node in node_schedule
+        if isinstance(node, SchedulerNode)
+        for dep in (*node.read_writes.reads, *node.read_writes.writes)
+        if isinstance(dep, MemoryDep)
+    }
+    return bool(sizes) and all(run * size % 16 == 0 for size in sizes)
+
+
+def flat_packet_runs(features: SIMDKernelFeatures, runs: tuple[int, int]) -> bool:
+    """Whether a persistent Welford reads its runs (Q, W) flat rather than
+    as a load each: where every run is whole packets (packet_runs()) and one
+    trip over the flat rdim keeps their packets (one_trip_runs())."""
+    return packet_runs(features.node_schedule, runs[1]) and one_trip_runs(
+        features.node_schedule, int(features.numel), runs[0] * runs[1]
+    )
+
+
+# The bytes of packets one trip over a flat rdim keeps in registers for the
+# sweeps after the first (the CuTe backend's issue_packets_first(): a quarter of
+# the register file of 65536 4-byte registers, whatever the thread count from
+# 256 threads on).
+ONE_TRIP_PACKET_BYTES = 65536
+
+
+def one_trip_runs(node_schedule: list[Any], numel: int, rnumel: int) -> bool:
+    """Whether one trip over a flat rdim of `rnumel` elements, a block of its
+    power of two, keeps in ONE_TRIP_PACKET_BYTES the packets of every buffer
+    the kernel reads along it (rdim_vars()). Its normalize sweep then reads
+    them from registers, as the runs read as loads (unroll_runs()) do: a
+    BatchNorm over [16, 128, 28, 28] bf16 with a bf16 residual holds 16384 *
+    (2 + 2) bytes, which fits. Past that, the flat rdim's normalize sweep
+    loads them again, where the runs keep theirs in one persistent block: the
+    same BatchNorm over [4, 64, 56, 56] float32 (16384 * (4 + 4) bytes) ran
+    6.37 us flat against 5.25 us with its runs unrolled, and over [8, 128, 28,
+    28] float32, at the budget (8192 * (4 + 4) bytes), 3.78 us flat against
+    3.97 us (GB300). Each node's reads are taken unnormalized, in its own
+    loop variables, so that a read through a slice of a larger buffer, or of
+    a tensor stored in another order (a channel-major residual permuted to
+    NCHW, 25088*d0 + 3136*d1 + d2), counts where its index moves along the
+    rdim."""
+    names: set[str] = set()
+    for node in node_schedule:
+        if not isinstance(node, SchedulerNode):
+            continue
+        reads = extract_read_writes(node._body, *node._sizes)
+        # Unnormalized reads always carry their loop variables and ranges.
+        along = rdim_vars(
+            cast("list[sympy.Expr]", reads.range_vars),
+            cast("dict[sympy.Expr, sympy.Expr]", reads.var_ranges),
+            numel,
+        )
+        names |= {
+            dep.name
+            for dep in reads.reads
+            if isinstance(dep, MemoryDep) and dep.index.free_symbols & along
+        }
+    held = sum(V.graph.get_dtype(name).itemsize for name in names)
+    return next_power_of_2(rnumel) * held <= ONE_TRIP_PACKET_BYTES
+
+
+def rdim_vars(
+    range_vars: Sequence[sympy.Expr],
+    var_ranges: Mapping[sympy.Expr, sympy.Expr],
+    numel: int,
+) -> set[sympy.Expr]:
+    """A node's loop variables that move along the kernel's rdim: those past
+    the leading ones whose sizes make up the kernel's `numel`, as d1 and d2 of
+    a BatchNorm over 16 channels iterating (16, 8, 3136), its reduction and
+    its normalize alike; none for a node over the channels alone (the running
+    statistics' update). Every variable where no leading ones make up
+    `numel`, so that such a node's reads all count."""
+    size = 1
+    for index, var in enumerate(range_vars):
+        if size == numel:
+            return set(range_vars[index:])
+        size *= int(var_ranges[var])
+    return set() if size == numel else set(range_vars)
 
 
 def reduction_types(features: SIMDKernelFeatures) -> OrderedSet[str | None]:
@@ -520,6 +621,28 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.unrolls_runs = self.runs is not None and "welford_reduce" in (
             reduction_types(kwargs["features"])
         )
+        # Runs a persistent Welford would unroll but reads flat, as whole
+        # packets (packet_runs()), in a loop over its rdim where no input names
+        # it (HelionScheduling.create_kernel_choices()): each block keeps the
+        # corrected two-pass of the persistent rdim it replaces (welford()).
+        # Asked without override_persistent_reduction: the looped kernel
+        # create_kernel_choices() builds with it False finds the runs its
+        # persistent first build would have unrolled.
+        self.flat_runs = False
+        if (
+            self.runs is None
+            and not no_runs
+            and helion_config.backend == "cute"
+            and "welford_reduce" in reduction_types(kwargs["features"])
+        ):
+            runs = self.rdim_runs(
+                kwargs["features"],
+                mix_order_reduction=bool(kwargs.get("mix_order_reduction")),
+                packets=False,
+            )
+            self.flat_runs = runs is not None and flat_packet_runs(
+                kwargs["features"], runs
+            )
         super().__init__(tiling, **kwargs)
         self.outer_vars: OrderedSet[CSEVariable] = OrderedSet()
         # A matmul orders r0_ before x so dot operands read [y, r0_] and [r0_, x].
@@ -870,6 +993,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         *,
         mix_order_reduction: bool = False,
         override_persistent_reduction: bool | None = None,
+        packets: bool = True,
     ) -> tuple[int, int] | None:
         """The runs (Q, W) of a reduction over dims apart in memory
         (reduction_runs()), which the kernel reads as a tile of its outer loop
@@ -905,9 +1029,11 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         then over the runs, which the kernel unrolls into one sum of the runs
         added elementwise (unroll_runs()); but not in a kernel with masked
         parts (masked_parts(): a cat over channels, whose parts the unrolled
-        runs would each load behind a mask), nor in one with a load or an
-        index expression that varies along a run but not along the runs
-        (broadcast_run_loads()).
+        runs would each load behind a mask), nor in one whose runs its flat
+        rdim reads faster (flat_packet_runs(): runs of whole 16-byte packets
+        that one trip keeps in registers; packets False asks without that
+        test), nor in one with a load or an index expression that varies along
+        a run but not along the runs (broadcast_run_loads()).
         Under the CuTe backend, None
         too for a kernel with a reduction that reads another of its
         reductions (the sum of (x - x.mean(...)) ** 2 over the runs), for
@@ -955,6 +1081,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             helion_config.backend != "cute"
             or not persistent()
             or masked_parts(features.node_schedule)
+            or (packets and flat_packet_runs(features, runs))
             or broadcast_run_loads(
                 features.node_schedule,
                 features.numel,
@@ -3461,13 +3588,23 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             # (asked as the kernel asks it, with its tiling scores) keeps its
             # two-pass, as Triton's persistent reductions compute it, and so
             # does a mix-order reduction's, which Inductor makes persistent
-            # itself (override_persistent_reduction).
-            corrected = (
-                self.persistent_reduction
-                and not self.mix_order_reduction
-                and not InductorChoices.should_use_persistent_reduction(
-                    self.features.with_tiling_scores(self.tiling_scores),
-                    self.cooperative_reduction,
+            # itself (override_persistent_reduction). A flat_runs kernel,
+            # which reads flat the runs of a persistent rdim (packet_runs()),
+            # takes the corrected two-pass in every block: as those runs did
+            # where Triton's rule loops, and where it does not as well, since
+            # its flat block sum adds their values in another order than the
+            # runs' elementwise sums did: a float64 BatchNorm normalize over
+            # [4, 32, 14, 14] of 1000 + 0.01 * randn() came out at 21076 ulp
+            # in the plain two-pass, against stock Inductor's 20046 (the
+            # runs: 17933).
+            corrected = not self.mix_order_reduction and (
+                self.flat_runs
+                or (
+                    self.persistent_reduction
+                    and not InductorChoices.should_use_persistent_reduction(
+                        self.features.with_tiling_scores(self.tiling_scores),
+                        self.cooperative_reduction,
+                    )
                 )
             )
             if self.persistent_reduction:
@@ -3727,11 +3864,14 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         """Whether welford()'s merges of a loop's blocks carry the rounding
         they lose into the next merge: for a reduction whose layout split
         HelionChoices.reduction_split_factor() declined although it reads
-        enough values to take it (UNSPLIT_LAYOUT on its node). Its kernel
-        reduces the whole rdim in one loop, where the split's first kernel
-        reduced runs of it and its second merged their partials. Other looped
-        Welfords merge as Triton's welford_combine does (KNOWN_GAPS.md,
+        enough values to take it (UNSPLIT_LAYOUT on its node), and in a
+        flat_runs kernel. Either loops over a whole rdim that would otherwise
+        be reduced in runs: by the split's first kernel, or as the persistent
+        block of runs that a flat_runs loop replaces. Other looped Welfords
+        merge as Triton's welford_combine does (KNOWN_GAPS.md,
         looped-welford-merge-rounding)."""
+        if self.flat_runs:
+            return True
         node = self.current_node
         operation = None if node is None else node.node
         return operation is not None and any(

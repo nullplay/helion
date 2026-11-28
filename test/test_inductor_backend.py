@@ -893,11 +893,32 @@ def check_unequal_cat_segment_loops(
     test.assertIsNone(re.search(r"hl\.tile\(\[\d+, 3\]\)", source))
 
 
+# The tolerance of a BatchNorm over values of 1000 + 0.01 * randn() in float32
+# against float64: any float32 mean is half a spacing of 1000 (3e-5) off at
+# best, 3e-3 of the spread, so eager's outputs are some 1e-3 off.
+OFFSET_TOL = 1e-2
+
+
+def bn_affine(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """A BatchNorm in training without running statistics, then a ReLU."""
+    return torch.relu(torch.nn.functional.batch_norm(x, None, None, w, b, True))
+
+
 def batch_norm_relu(x, mean, var, weight, bias):
     """A training BatchNorm with its running statistics updated in place,
     then a ReLU."""
     y = torch.nn.functional.batch_norm(x, mean, var, weight, bias, True, 0.1)
     return torch.relu(y), mean, var
+
+
+def mean_ulp(result: torch.Tensor, expected: torch.Tensor) -> float:
+    """The mean error of float32 `result` against float64 `expected`, in
+    spacings of float32 at `expected` (its nonzero elements)."""
+    ref = expected.float().abs()
+    spacing = torch.nextafter(ref, torch.full_like(ref, math.inf)) - ref
+    keep = ref > 0
+    error = (result.double() - expected).abs()[keep] / spacing.double()[keep]
+    return error.mean().item()
 
 
 def check_window_spans(test: InductorBackendTestCase, backend: str) -> None:
@@ -1623,21 +1644,178 @@ class TestInductorCute(InductorBackendTestCase):
         self.assertNotIn("tile_q", source)
 
     def test_batch_norm_unrolls_runs_over_the_layout_split(self):
-        # 1.2M values over rdims of 12544, which the layout split would take
+        # 1.4M values over rdims of 14400, which the layout split would take
         # (HelionChoices.layout_split_pays()): one kernel all the same, its 16
-        # runs unrolled (HelionChoices.reads_runs()), where the statistics
-        # alone keep the split's kernels.
-        x = torch.randn(16, 96, 28, 28, device=DEVICE, dtype=torch.bfloat16)
+        # runs of 900 unrolled (HelionChoices.reads_runs()), where the
+        # statistics alone keep the split's kernels. Runs of 784, whole
+        # packets, read flat: test_batch_norm_reads_whole_packet_runs_flat.
+        x = torch.randn(16, 96, 30, 30, device=DEVICE, dtype=torch.bfloat16)
         w, b = torch.randn(96, device=DEVICE), torch.randn(96, device=DEVICE)
-
-        def bn_affine(x, w, b):
-            y = torch.nn.functional.batch_norm(x, None, None, w, b, True)
-            return torch.relu(y)
 
         (source,) = self.compile(bn_affine, x, w, b, tol=2e-2, backend="cute")
         self.assertRegex(source, r"in\d+\[tile_x, 15, :\]")
         stats = lambda x: torch.var_mean(x, [0, 2, 3], correction=0)  # noqa: E731
         self.assertGreater(len(self.compile(stats, x, tol=1e-2, backend="cute")), 1)
+
+    def test_batch_norm_reads_whole_packet_runs_flat(self):
+        # Runs that are whole 16-byte packets of every buffer the kernel moves
+        # (packet_runs()): one persistent kernel that reads its rdim flat, at
+        # r // W and r % W, rather than a load per run. 16 runs of 784 bf16
+        # elements (98 packets) over the layout split's bound, as
+        # test_batch_norm_unrolls_runs_over_the_layout_split's 900, and, with
+        # its running statistics updated in place, 4 runs of 196 float32
+        # elements (49 packets), which in bf16 split packets and unroll
+        # (test_batch_norm_unrolls_runs).
+        x = torch.randn(16, 96, 28, 28, device=DEVICE, dtype=torch.bfloat16)
+        w, b = torch.randn(96, device=DEVICE), torch.randn(96, device=DEVICE)
+        (source,) = self.compile(bn_affine, x, w, b, tol=2e-2, backend="cute")
+        self.assertIn("// 784", source)
+        self.assertNotRegex(source, r"in\d+\[tile_x, \d+, :\]")
+        # Its rdim of 12544, which no input names, loops over chunks
+        # (HelionScheduling.create_kernel_choices()), whose blocks keep the
+        # corrected two-pass of the persistent runs it replaces and whose
+        # merges carry their rounding (welford()), so values of a large mean
+        # and a small spread normalize as accurately as the runs did.
+        x = 1000 + 0.01 * torch.randn(16, 96, 28, 28, device=DEVICE)
+        expected = bn_affine(x.double(), w.double(), b.double()).float()
+        (source,) = self.compile(
+            bn_affine, x, w, b, expected=expected, tol=OFFSET_TOL, backend="cute"
+        )
+        self.assertIn("// 784", source)
+        # The merge's steps less the roundings the last merge lost: of the
+        # mean (acc3) and of m2 (acc4).
+        self.assertIn(" - acc3", source)
+        self.assertIn(" - acc4", source)
+        # Without m2's carry, the running variance that 4 runs of 3136
+        # float32 elements update from zero statistics, after 784 merges at
+        # the default config, came out 4-10 spacings of float32 off (eager
+        # about 0.6); with it, at eager's error.
+        x = torch.randn(4, 128, 56, 56, device=DEVICE)
+        weight, bias = torch.randn(128, device=DEVICE), torch.randn(128, device=DEVICE)
+        zeros = torch.zeros(128, device=DEVICE)
+        expected = batch_norm_relu(
+            x.double(),
+            zeros.double(),
+            zeros.double(),
+            weight.double(),
+            bias.double(),
+        )
+        sources = self.compile(
+            batch_norm_relu,
+            x,
+            zeros.clone(),
+            zeros.clone(),
+            weight,
+            bias,
+            expected=tuple(e.float() for e in expected),
+            tol=1e-4,
+            backend="cute",
+        )
+        (source,) = [s for s in sources if "hl.tile(128)" in s]
+        self.assertIn("// 3136", source)
+        eager = batch_norm_relu(x, zeros.clone(), zeros.clone(), weight, bias)
+        self.assertLess(
+            mean_ulp(self.result[2], expected[2]), mean_ulp(eager[2], expected[2]) + 1
+        )
+
+        x = torch.randn(4, 32, 14, 14, device=DEVICE)
+        mean, var = torch.zeros(32, device=DEVICE), torch.ones(32, device=DEVICE)
+        weight, bias = torch.randn(32, device=DEVICE), torch.randn(32, device=DEVICE)
+        expected = batch_norm_relu(x, mean.clone(), var.clone(), weight, bias)
+        sources = self.compile(
+            batch_norm_relu,
+            x,
+            mean,
+            var,
+            weight,
+            bias,
+            expected=expected,
+            tol=1e-4,
+            backend="cute",
+        )
+        (source,) = [s for s in sources if "hl.tile(32)" in s]
+        self.assertIn("// 196", source)
+        self.assertNotRegex(source, r"in\d+\[tile_x, \d+, :\]")
+
+    def test_batch_norm_unrolls_runs_a_buffer_splits(self):
+        # packet_runs() asks every buffer the kernel moves: runs of 196
+        # float32 elements are whole packets of the input, but the bf16
+        # output's split them; runs of 24 bf16 elements are whole packets,
+        # but a bool output's (a ReLU's mask) split them. Both kernels keep a
+        # load per run, which they read flat without the narrow output, as
+        # test_batch_norm_reads_whole_packet_runs_flat does.
+        x = torch.randn(4, 32, 14, 14, device=DEVICE)
+        mean, var = torch.zeros(32, device=DEVICE), torch.ones(32, device=DEVICE)
+        weight, bias = torch.randn(32, device=DEVICE), torch.randn(32, device=DEVICE)
+
+        def bn_bf16_out(x, mean, var, weight, bias):
+            y, mean, var = batch_norm_relu(x, mean, var, weight, bias)
+            return y.to(torch.bfloat16), mean, var
+
+        expected = bn_bf16_out(x, mean.clone(), var.clone(), weight, bias)
+        sources = self.compile(
+            bn_bf16_out,
+            x,
+            mean,
+            var,
+            weight,
+            bias,
+            expected=expected,
+            tol=2e-2,
+            backend="cute",
+        )
+        (source,) = [s for s in sources if "hl.tile(32)" in s]
+        self.assertRegex(source, r"in\d+\[tile_x, 3, :\]")
+
+        def bn_mask(x, w, b):
+            y = bn_affine(x, w, b)
+            return y, y > 0
+
+        x = torch.randn(4, 32, 6, 4, device=DEVICE, dtype=torch.bfloat16)
+        w, b = torch.randn(32, device=DEVICE), torch.randn(32, device=DEVICE)
+        (source,) = self.compile(bn_mask, x, w, b, tol=2e-2, backend="cute")
+        self.assertRegex(source, r"in\d+\[tile_x, 3, :\]")
+        (source,) = self.compile(bn_affine, x, w, b, tol=2e-2, backend="cute")
+        self.assertIn("// 24", source)
+
+    def test_batch_norm_unrolls_runs_past_one_trip(self):
+        # Runs of whole packets whose flat rdim one trip cannot keep in
+        # registers (one_trip_runs()): 8 runs of 3136 bf16 elements beside a
+        # bf16 residual hold 32768 * (2 + 2) bytes, twice ONE_TRIP_PACKET_BYTES,
+        # so the kernel keeps a load per run; 4 runs (16384 * 4 bytes) read
+        # flat. 16 channels, so that a mix-up of channels and images shows.
+        def bn_residual(x, r, w, b):
+            return torch.relu(bn_affine(x, w, b) + r)
+
+        w, b = torch.randn(16, device=DEVICE), torch.randn(16, device=DEVICE)
+        for images, flat in ((8, False), (4, True)):
+            x, r = (
+                torch.randn(images, 16, 56, 56, device=DEVICE, dtype=torch.bfloat16)
+                for _ in range(2)
+            )
+            (source,) = self.compile(bn_residual, x, r, w, b, tol=2e-2, backend="cute")
+            if flat:
+                self.assertIn("// 3136", source)
+            else:
+                self.assertRegex(source, r"in\d+\[tile_x, 7, :\]")
+
+        # Reads whose index moves along the rdim count however the buffer is
+        # stored (rdim_vars()): through slices of larger buffers, and from a
+        # residual stored channel-major and permuted to NCHW.
+        def bn_residual_sliced(x, r, w, b):
+            return bn_residual(x[:, :16], r[:, :16], w, b)
+
+        def bn_residual_channel_major(x, r, w, b):
+            return bn_residual(x, r.permute(1, 0, 2, 3), w, b)
+
+        for fn, x_shape, r_shape in (
+            (bn_residual_sliced, (8, 32, 56, 56), (8, 32, 56, 56)),
+            (bn_residual_channel_major, (8, 16, 56, 56), (16, 8, 56, 56)),
+        ):
+            x = torch.randn(*x_shape, device=DEVICE, dtype=torch.bfloat16)
+            r = torch.randn(*r_shape, device=DEVICE, dtype=torch.bfloat16)
+            (source,) = self.compile(fn, x, r, w, b, tol=2e-2, backend="cute")
+            self.assertRegex(source, r"in\d+\[tile_x, 7, :\]")
 
     def test_batch_norm_reads_flat_where_runs_do_not_unroll(self):
         # Over a cat of 16 + 8 channels (DenseNet's), whose parts the kernel
@@ -1671,7 +1849,10 @@ class TestInductorCute(InductorBackendTestCase):
             tol=2e-2,
             backend="cute",
         )
-        x = torch.randn(4, 32, 14, 14, device=DEVICE)
+        # bf16 inputs: runs of 196 split their packets (packet_runs()), so the
+        # kernels reach the tests named above rather than the flat read of
+        # whole-packet runs.
+        x = torch.randn(4, 32, 14, 14, device=DEVICE, dtype=torch.bfloat16)
         w = torch.randn(32, device=DEVICE)
         heights = torch.randn(1, 1, 14, 1, device=DEVICE)
 
@@ -1707,13 +1888,13 @@ class TestInductorCute(InductorBackendTestCase):
                 tol=1e-3,
                 backend="cute",
             )
-        x = torch.randn(4, 64, 14, 14, device=DEVICE)
+        x = torch.randn(4, 64, 14, 14, device=DEVICE, dtype=torch.bfloat16)
 
         def bn_amax(x):
             var, mean = torch.var_mean(x, [0, 2, 3], correction=0, keepdim=True)
             return (x - mean) * torch.rsqrt(var + 1e-5), x.amax([0, 2, 3])
 
-        sources += self.compile(bn_amax, x, tol=1e-4, backend="cute")
+        sources += self.compile(bn_amax, x, tol=2e-2, backend="cute")
         code = "\n".join(sources)
         self.assertNotIn("tile_q", code)
         self.assertNotRegex(code, r"in\d+\[tile_x, \d+, :\]")
