@@ -2909,6 +2909,46 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         ):
             self.assertFalse(match_device_out_of_memory(RuntimeError(message)), message)
 
+    def test_unrecoverable_runtime_error_matches_every_sticky_kernel_fault(
+        self,
+    ) -> None:
+        # The faults of a running kernel that CUDA documents as leaving the
+        # process unusable, in torch's wording (cudaGetErrorString's) and in
+        # cuda-python's (the driver enum): each replaces the benchmark worker.
+        for message in (
+            (
+                "CUDA error: Invalid access of peer GPU memory over nvlink or a "
+                "hardware error"
+            ),
+            "CUDA error: an illegal memory access was encountered",
+            "CUDA error: the launch timed out and was terminated",
+            "CUDA error: device-side assert triggered",
+            "CUDA error: hardware stack error",
+            "CUDA error: an illegal instruction was encountered",
+            "CUDA error: misaligned address",
+            "CUDA error: operation not supported on global/shared address space",
+            "CUDA error: invalid program counter",
+            "CUDA error: unspecified launch failure",
+            "CUDA error: tensor memory not completely freed",
+            "CUDA occupancy query failed: <CUresult.CUDA_ERROR_LAUNCH_FAILED: 719>",
+            (
+                "CUDA cluster occupancy query failed: "
+                "<CUresult.CUDA_ERROR_INVALID_ADDRESS_SPACE: 717>"
+            ),
+        ):
+            self.assertTrue(
+                match_unrecoverable_runtime_error(RuntimeError(message)), message
+            )
+        for message in (
+            "CUDA error: invalid argument",
+            "CUDA error: too many resources requested for launch",
+            "CUDA error: out of memory",
+            "CUDA occupancy query failed: <CUresult.CUDA_ERROR_INVALID_VALUE: 1>",
+        ):
+            self.assertFalse(
+                match_unrecoverable_runtime_error(RuntimeError(message)), message
+            )
+
     def test_unrecoverable_runtime_error_matches_xpu_device_lost(self) -> None:
         for message in (
             "level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)",

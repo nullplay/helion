@@ -555,3 +555,40 @@ these labelled lines.
   transcendental; judging it takes timings of its own.
 - Pinned by: `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rolled_copy_of_an_op_reads_its_index_in_the_enclosing_graph`
   (`slab_numel == 576`).
+
+## cute-strided-vector-lane-fault-in-1024-thread-ctas
+
+- Area: CuTe backend, a reduction over the middle dim of a tile whose first
+  dim's lanes are strided and 8 wide in a CTA of 1024 threads. The
+  autotuner skips such a config as failed (it replaces the benchmark worker
+  after the fault); a user config that sets it faults.
+- What is wrong: the first kernel of better-benchmark's
+  var_mean_2056ae6e1995_8f9cb8b8, a var_mean over r of `in0[tile_y, tile_r,
+  tile_x]` for in0 `[16384, 392, 8]` bf16, strides `(3136, 8, 1)`:
+
+      for tile_y, tile_x in hl.tile([16384, 8]):
+          ...
+          for tile_r in hl.tile(392):
+              tmp0 = in0[tile_y, tile_r, tile_x].to(torch.float32)
+              ...  # Welford merge of the block's torch.sum(..., -2)s
+
+  at `block_sizes=[512, 8, 256], num_threads=[8, 8, 16],
+  cute_lane_layouts=['strided'] * 3, cute_vector_widths=[8, 1, 4]` faults on
+  a GB300: run alone, "an illegal memory access was encountered" (700), and
+  compute-sanitizer reports about 1024 invalid `__global__` reads of 2
+  bytes far past in0's 102.8 MB allocation (0.76 GB and 8.3 GB past it in
+  two runs); inside an autotuner search the same config left "operation
+  not supported on global/shared address space" (717). The generated CuTe
+  source's indices stay within in0 (at most 15872 + 511 on y). Vector
+  widths `[1, 1, 4]`, blocked lane layouts or `num_threads=[8, 8, 8]` (the
+  shared reduces over 512 threads, `group_span=512`) run clean;
+  `cute_min_blocks_per_mp=1`, no load eviction policy, `block_sizes[0]` 256
+  and `cute_pdl=False` still fault. Measured on upstream main at ba2e8c720
+  as well (CuTe DSL 4.8.1): the same fault, the same render but for one
+  bound expression, and `num_threads=[8, 8, 8]` clean.
+- Since: on `main` when the entry was added.
+- Why deferred: the wrong address does not show in the CuTe source, and
+  the variants above narrow it to the 1024-thread CTA with strided 8-wide
+  lanes, not to a statement; finding it takes the kernel's SASS, an
+  investigation in the CuTe backend of its own.
+- Pinned by: none.
