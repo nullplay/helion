@@ -21,6 +21,7 @@ from helion._testing.cute_grid_lane_jam_kernels import HEAD_ROWS_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import ROW_NORM_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import SCALAR_ROWS_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import SCATTER_CONFIG
+from helion._testing.cute_grid_lane_jam_kernels import TRANSPOSED_SUM_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import bias_softmax
 from helion._testing.cute_grid_lane_jam_kernels import bucket_grad_scatter
 from helion._testing.cute_grid_lane_jam_kernels import doubled_rows_plus_one
@@ -34,6 +35,8 @@ from helion._testing.cute_grid_lane_jam_kernels import kept_row_norm
 from helion._testing.cute_grid_lane_jam_kernels import row_dot
 from helion._testing.cute_grid_lane_jam_kernels import row_norm
 from helion._testing.cute_grid_lane_jam_kernels import scale_rows_in_place
+from helion._testing.cute_grid_lane_jam_kernels import scaled_copy_and_sum
+from helion._testing.cute_grid_lane_jam_kernels import transposed_sum_inputs
 
 
 def _run(keys: int, jam: bool, args: tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -338,3 +341,38 @@ def test_a_one_axis_tile_is_bitwise_the_rolled_lane_loop() -> None:
     torch.testing.assert_close(
         actual, (x.float() * xt.float()).sum(-1), rtol=1e-4, atol=1e-3
     )
+
+
+@pytest.mark.parametrize(
+    ("n_c", "dtype", "out_offset"),
+    [
+        (64, torch.bfloat16, 0),  # one bf16 packet per r
+        (64, torch.float32, 0),  # two fp32 packets per r
+        (64, torch.bfloat16, 1),  # misaligned out: scalar stores
+        (36, torch.bfloat16, 0),  # a column tail: the rolled lanes
+    ],
+)
+def test_jammed_column_stores_are_bitwise_the_rolled_lanes(
+    n_c: int, dtype: torch.dtype, out_offset: int
+) -> None:
+    torch.manual_seed(0)
+    x, _, _ = transposed_sum_inputs(3, n_c, dtype, device=DEVICE, out_offset=out_offset)
+    results = []
+    for jam in (False, True):
+        _, out, total = transposed_sum_inputs(
+            3, n_c, dtype, device=DEVICE, out_offset=out_offset
+        )
+        out.fill_(7)
+        total.fill_(7)
+        helion.kernel(
+            scaled_copy_and_sum,
+            backend="cute",
+            static_shapes=True,
+            config=helion.Config(**TRANSPOSED_SUM_CONFIG, cute_grid_lane_jam=jam),
+        )(x, out, total)
+        results.append((out.clone(), total.clone()))
+    (out0, total0), (out1, total1) = results
+    assert torch.equal(out1, out0)
+    assert torch.equal(total1, total0)
+    torch.testing.assert_close(out1.float(), (x.float() * 0.5).to(dtype).float())
+    torch.testing.assert_close(total1, (x.float() * 0.5).sum(1), rtol=1e-4, atol=1e-4)
