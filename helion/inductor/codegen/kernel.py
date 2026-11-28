@@ -28,6 +28,7 @@ from torch._inductor.ir import Reduction
 from torch._inductor.ir import ReinterpretView
 from torch._inductor.runtime.hints import ReductionHint
 from torch._inductor.runtime.runtime_utils import next_power_of_2
+from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.shape_propagation import ShapePropagationOpsHandler
 from torch._inductor.utils import IndentedBuffer
 from torch._inductor.utils import sympy_subs
@@ -46,11 +47,14 @@ from .overrides import HelionPrinter
 from .overrides import number_constant
 from .overrides import upcast_compute_type
 from .sequence import note_call
+from .tiling import REDUCTION_RUNS_MAX
 from .tiling import UNROLLED_RDIM_MAX
+from .tiling import broadcast_run_loads
 from .tiling import broadcast_runs
 from .tiling import contiguous_reads
 from .tiling import reduction_runs
 from .tiling import static_int
+from .unroll_runs import unroll_runs
 
 _T = TypeVar("_T")
 
@@ -412,6 +416,34 @@ UNSPLIT_LAYOUT = "helion_unsplit_layout"
 # ForEachProgramID), whose dispatch tests the program id against every
 # earlier case's grid.
 SEGMENT_LOOPS_MAX = 8
+# The most runs of a persistent Welford that HelionKernel.rdim_runs() reads by
+# runs and unrolls into one load per run (unroll_runs()): a BatchNorm over up
+# to 16 images. Each run is as many copies of every statement that reads it,
+# and as many values held per thread: 16 runs of 784 bf16 elements over 256
+# threads of 4 lanes keep 64 values of each tensor a thread reads.
+UNROLL_RUNS_MAX = 16
+
+
+def masked_parts(node_schedule: list[Any]) -> bool:
+    """Whether a node of the kernel has masked parts (ops.masked(): a cat's
+    parts, a pad's source). A BatchNorm over a cat of channels whose runs
+    unroll loads each run of each part behind a mask: DenseNet's over 64 + 5 *
+    32 channels of 4 images of 3136 pixels (better-benchmark's
+    var_mean_0a75c9632b84_da84b51a) ran 22 us so (GB300), where the layout
+    split's partials, one loop per part (segment loops), took 7.3 us."""
+    return any(
+        isinstance(node, SchedulerNode) and node._body.subblocks
+        for node in node_schedule
+    )
+
+
+def reduction_types(features: SIMDKernelFeatures) -> OrderedSet[str | None]:
+    """The reduction types of a kernel's reductions: "sum", "welford_reduce"
+    and so on."""
+    return OrderedSet(
+        cast("ComputedBuffer", node.node).get_reduction_type()
+        for node in features.reduction_nodes()
+    )
 
 
 def as_less(relation: sympy.Rel) -> tuple[sympy.Basic, sympy.Basic, bool]:
@@ -469,10 +501,24 @@ class HelionKernel(SIMDKernel[CSEVariable]):
     def __init__(self, tiling: dict[str, sympy.Expr], **kwargs: Any) -> None:  # noqa: ANN401
         # The runs (Q, W) the rdim is read by, set before SIMDKernel.__init__
         # asks should_use_persistent_reduction(); see rdim_runs().
-        self.runs = self.rdim_runs(
-            kwargs["features"],
-            mix_order_reduction=bool(kwargs.get("mix_order_reduction")),
-            override_persistent_reduction=kwargs.get("override_persistent_reduction"),
+        # no_runs: a kernel whose runs unroll_runs() declined reads its rdim
+        # flat (HelionScheduling.create_kernel_choices()).
+        no_runs = kwargs.pop("no_runs", False)
+        self.runs = (
+            None
+            if no_runs
+            else self.rdim_runs(
+                kwargs["features"],
+                mix_order_reduction=bool(kwargs.get("mix_order_reduction")),
+                override_persistent_reduction=kwargs.get(
+                    "override_persistent_reduction"
+                ),
+            )
+        )
+        # A Welford over runs, persistent under the CuTe backend (rdim_runs()),
+        # unrolls them into one value per run (unroll_runs()).
+        self.unrolls_runs = self.runs is not None and "welford_reduce" in (
+            reduction_types(kwargs["features"])
         )
         super().__init__(tiling, **kwargs)
         self.outer_vars: OrderedSet[CSEVariable] = OrderedSet()
@@ -853,7 +899,16 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         whose rdim is no run of memory (reads_strided_rdim()), and a reduction
         other than sum, prod, max, min and any: a native matmul's dot, whose K
         loop is tile_r, or a Welford's or an argmax's, whose partials of the
-        runs would need a combine of their own. Under the CuTe backend, None
+        runs would need a combine of their own. A Welford's all the same under
+        the CuTe backend in a persistent kernel of up to UNROLL_RUNS_MAX runs,
+        a BatchNorm's in training: each statistic's sum over the block and
+        then over the runs, which the kernel unrolls into one sum of the runs
+        added elementwise (unroll_runs()); but not in a kernel with masked
+        parts (masked_parts(): a cat over channels, whose parts the unrolled
+        runs would each load behind a mask), nor in one with a load or an
+        index expression that varies along a run but not along the runs
+        (broadcast_run_loads()).
+        Under the CuTe backend, None
         too for a kernel with a reduction that reads another of its
         reductions (the sum of (x - x.mean(...)) ** 2 over the runs), for
         one that loops over a run and writes a buffer in place
@@ -867,34 +922,55 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         override_persistent_reduction False. Decided here, before
         SIMDKernel.__init__, which an override_persistent_reduction keeps
         from asking should_use_persistent_reduction()."""
+        types = reduction_types(features)
         if (
             features.reduction_numel == 1
             or mix_order_reduction
             or any(
-                cast("ComputedBuffer", node.node).get_reduction_type()
-                not in REDUCTION_FUNCTIONS
-                for node in features.reduction_nodes()
+                kind not in REDUCTION_FUNCTIONS and kind != "welford_reduce"
+                for kind in types
             )
             or HelionKernel.reads_strided_rdim(features)
         ):
             return None
+        # A persistent Welford unrolls its runs (unroll_runs()), up to
+        # UNROLL_RUNS_MAX of them.
         runs = reduction_runs(
-            features.node_schedule, features.numel, features.reduction_numel
+            features.node_schedule,
+            features.numel,
+            features.reduction_numel,
+            UNROLL_RUNS_MAX if "welford_reduce" in types else REDUCTION_RUNS_MAX,
         )
-        if runs is not None and helion_config.backend == "cute":
+        if runs is None:
+            return None
+
+        def persistent() -> bool:
+            if override_persistent_reduction is not None:
+                return override_persistent_reduction
+            return names_rdim(
+                sympy.Integer(runs[1])
+            ) and V.choices.should_use_persistent_reduction(features, False)
+
+        if "welford_reduce" in types and (
+            helion_config.backend != "cute"
+            or not persistent()
+            or masked_parts(features.node_schedule)
+            or broadcast_run_loads(
+                features.node_schedule,
+                features.numel,
+                features.reduction_numel,
+                runs,
+            )
+        ):
+            return None
+        if helion_config.backend == "cute":
             reductions = features.reduction_nodes()
             names = OrderedSet(
                 name for node in reductions for name in node.get_operation_names()
             )
             if any(node.ancestors & names for node in reductions):
                 return None
-            persistent = (
-                override_persistent_reduction
-                if override_persistent_reduction is not None
-                else names_rdim(sympy.Integer(runs[1]))
-                and V.choices.should_use_persistent_reduction(features, False)
-            )
-            if not persistent and any(
+            if not persistent() and any(
                 node.has_aliasing_or_mutation() for node in features.scheduler_nodes()
             ):
                 return None
@@ -1741,24 +1817,70 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             elif self.segment_bodies:
                 self.codegen_segment_loops(code)
             else:
-                tiles = ", ".join(TILE_NAMES[axis] for axis in self.outer_axes)
-                sizes = ", ".join(str(self.extents[axis]) for axis in self.outer_axes)
-                sizes = sizes if len(self.outer_axes) == 1 else f"[{sizes}]"
-                if self.runs is not None:
-                    # One block holds every run (rdim_runs()): a power of two,
-                    # as Triton's tl.arange takes, whose lanes past the runs
-                    # Helion masks.
-                    block = 1 << (self.runs[0] - 1).bit_length()
-                    blocks = ", ".join(
-                        str(block) if axis == "q_" else "None"
-                        for axis in self.outer_axes
-                    )
-                    sizes += f", block_size=[{blocks}]"
-                code.writeline(f"for {tiles} in hl.tile({sizes}):")
-                with code.indent():
-                    self.codegen_rdim(code, TILE_NAMES[self.outer_axes[-1]])
-                    code.splice(self.body)
-        return re.sub(r"__arg\d+__", lambda ref: names[ref[0]], code.getvalue())
+                self.codegen_loop(code)
+        source = re.sub(r"__arg\d+__", lambda ref: names[ref[0]], code.getvalue())
+        if self.unrolls_runs and self.persistent_reduction:
+            assert self.runs is not None
+            # One value per run, added elementwise before each reduction over
+            # the run (unroll_runs()). HelionScheduling.create_kernel_choices()
+            # probed this kernel's body (runs_unroll()); one it would decline
+            # reads its rdim flat, as the tile of the runs does not compile.
+            unrolled = unroll_runs(source, self.runs[0])
+            if unrolled is None:
+                raise RuntimeError("unroll_runs() declined a probed kernel")
+            source = unrolled
+        return source
+
+    def codegen_loop(self, code: IndentedBuffer) -> None:
+        """The kernel's one loop over its outer tiles, with its body."""
+        tiles = ", ".join(TILE_NAMES[axis] for axis in self.outer_axes)
+        sizes = ", ".join(str(self.extents[axis]) for axis in self.outer_axes)
+        sizes = sizes if len(self.outer_axes) == 1 else f"[{sizes}]"
+        if self.runs is not None:
+            # One block holds every run (rdim_runs()): a power of two, as
+            # Triton's tl.arange takes, whose lanes past the runs Helion masks.
+            block = 1 << (self.runs[0] - 1).bit_length()
+            blocks = ", ".join(
+                str(block) if axis == "q_" else "None" for axis in self.outer_axes
+            )
+            sizes += f", block_size=[{blocks}]"
+        code.writeline(f"for {tiles} in hl.tile({sizes}):")
+        with code.indent():
+            self.codegen_rdim(code, self.rdim_tile())
+            code.splice(self.body)
+
+    def runs_unroll(self) -> bool:
+        """Whether unroll_runs() unrolls the kernel's runs, once a probe has
+        emitted its body (HelionScheduling.create_kernel_choices()): its loop
+        with each argument named by its placeholder, __arg3__ as arg3. No
+        kernel with a value over the rdim but not the runs unrolls: an [x]
+        value that meets it is reshaped to [tile_x, 1], which unroll_runs()
+        reads as [tile_x, tile_q] and drops the runs' 1 from,
+
+            tmp2 = ((hl.arange(rdim) // 14) % 14).to(torch.float32)
+            tmp3 = tmp1.reshape([tile_x])        # was tmp1.reshape([tile_x, 1])
+            tmp4 = tmp3 * tmp2                   # [tile_x] against [rdim]
+
+        a kernel that does not compile (a BatchNorm of x + w.view(1, 32, 1, 1)
+        * torch.arange(14).view(1, 1, 14, 1), runs of 196, where the height
+        index (r // 14) % 14 takes no term of q; broadcast_run_loads()'s
+        samples of the index miss it, as the index is 0 at r = 0, 1 and
+        196)."""
+        assert self.runs is not None
+        self.codegen_body()
+        for var in self.cse.varname_map.values():
+            axes = tile_axes(var.shape)
+            if "r0_" in axes and "q_" not in axes:
+                return False
+        code = IndentedBuffer()
+        code.writeline("def kernel(params) -> None:")
+        with code.indent():
+            self.codegen_loop(code)
+        source = code.getvalue()
+        refs = dict.fromkeys(re.findall(r"__arg\d+__", source))
+        source = source.replace("params", ", ".join(ref.strip("_") for ref in refs), 1)
+        source = re.sub(r"__arg\d+__", lambda ref: ref[0].strip("_"), source)
+        return unroll_runs(source, self.runs[0]) is not None
 
     def codegen_segment_loops(self, code: IndentedBuffer) -> None:
         """One top-level loop per segment of the segmented axis
@@ -1821,7 +1943,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                 sizes = f"{sizes}, block_size={blocks}"
             code.writeline(f"for {tiles} in hl.tile({sizes}):")
             with code.indent():
-                self.codegen_rdim(code, TILE_NAMES[self.outer_axes[-1]])
+                self.codegen_rdim(code, self.rdim_tile())
                 code.splice(body)
 
     def shared_segment_blocks(self, length: int) -> dict[str, str] | None:
@@ -1853,6 +1975,17 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             axis: f"block_{TILE_NAMES[axis].removeprefix('tile_')}{group}"
             for axis in [*self.outer_axes, "r0_"]
         }
+
+    def rdim_tile(self) -> str:
+        """The tile beside which codegen_rdim() defines rdim: the innermost
+        outer tile, but tile_x rather than tile_q where the runs unroll
+        (unroll_runs()), whose kernel has no tile_q:
+            rdim = hl.zeros([tile_x, 49]).size(1)
+        where hl.zeros([tile_q, 49]) would keep the runs a tile."""
+        axes = [
+            axis for axis in self.outer_axes if not (self.unrolls_runs and axis == "q_")
+        ]
+        return TILE_NAMES[(axes or list(self.outer_axes))[-1]]
 
     def codegen_rdim(self, code: IndentedBuffer, tile: str) -> None:
         """Define rdim (rdim_code()): for an rdim of more than UNROLLED_RDIM_MAX
@@ -3276,6 +3409,11 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             term: CSEVariable, empty: CSEVariable | None = None
         ) -> CSEVariable:
             total = self.reduce_block_value("sum", term, dtype)
+            if self.runs is not None and self.persistent_reduction:
+                # Over the runs too (rdim_runs()), tmp6 = torch.sum(tmp5, -1)
+                # after tmp5 = torch.sum(tmp4, -1), which unroll_runs() reads
+                # as one sum of the runs.
+                total = self.reduce_runs("sum", total)
             return total if empty is None else ops.where(empty, zero, total)
 
         # Two sums over each block, as Inductor's welford_reduce_fallback()

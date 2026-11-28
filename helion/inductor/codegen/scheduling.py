@@ -38,6 +38,7 @@ from ..support import python_wrapper
 from .kernel import ARG_REDUCTIONS
 from .kernel import REDUCTIONS
 from .kernel import HelionKernel
+from .kernel import masked_parts
 from .overrides import HelionOverrides
 from .sequence import module_key
 from .sequence import predecessor
@@ -528,6 +529,16 @@ class HelionScheduling(SIMDScheduling):
         if not HelionKernel.supports_tiling(tiling):
             raise Unsupported(f"tiling {tiling}")
         kernel = HelionKernel(*kernel_args, **kernel_kwargs)
+        if kernel.unrolls_runs and kernel.persistent_reduction:
+            # A Welford's runs that unroll_runs() declines would stay a tile of
+            # the outer loop, which the CuTe backend refuses at every config
+            # ("threads sharing a tile axis race on a tensor in a body a later
+            # pass rewrites (_helion_lane_reduce)"): such a kernel reads its
+            # rdim flat, as it did before it read runs.
+            self.probe(kernel_features, kernel)
+            if not kernel.runs_unroll():
+                kernel_kwargs = {**kernel_kwargs, "no_runs": True}
+            kernel = HelionKernel(*kernel_args, **kernel_kwargs)
         if kernel.mix_order_reduction:
             return [kernel]
         # A comparison of an index with an integer cuts an axis into segments
@@ -537,10 +548,7 @@ class HelionScheduling(SIMDScheduling):
         # iota). The probe that finds the cuts runs for a kernel with a
         # masked part, and for a pointwise kernel of three tile axes, which it
         # probes for axis_split() anyway.
-        masked = any(
-            isinstance(node, SchedulerNode) and node._body.subblocks
-            for node in kernel_features.node_schedule
-        )
+        masked = masked_parts(kernel_features.node_schedule)
         if not kernel.persistent_reduction:
             # A pointwise kernel of three tile axes, all natural_tiling() tiles,
             # may have joined two dims into one that an index no view reads

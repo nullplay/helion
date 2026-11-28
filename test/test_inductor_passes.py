@@ -25,6 +25,8 @@ if not requires_torch_version("2.16"):
 import helion.inductor
 from helion.inductor import config as helion_config
 from helion.inductor.choices import HelionChoices
+from helion.inductor.choices import normalized_by
+from helion.inductor.choices import reads_masked_parts
 from helion.inductor.fx_passes import post_grad
 from helion.inductor.fx_passes.cat_reductions import pointwise
 from helion.inductor.fx_passes.cat_reductions import split_cat_reductions
@@ -550,6 +552,52 @@ class TestLayoutSplit(TestCase):
             self.assertIsNone(HelionChoices.layout_split(604, 8, 1))
         with V.set_graph_handler(SimpleNamespace(current_node=transposed)):
             self.assertIsNone(HelionChoices.layout_split(4 * 94828, 8, 47))
+
+    def test_normalized_by(self):
+        # A BatchNorm's var_mean, whose statistics normalize its input, also
+        # where it reads its bf16 input converted to float32 and the
+        # normalization the input itself (sub(x, mean) promotes it); a
+        # var_mean whose outputs only leave the graph is not.
+        def batch_norm(x):
+            var, mean = torch.var_mean(x.float(), [0, 2, 3], correction=0)
+            return (x - mean[None, :, None, None]) * torch.rsqrt(var + 1e-5)[
+                None, :, None, None
+            ]
+
+        def statistics(x):
+            return torch.var_mean(x.float(), [0, 2, 3], correction=0)
+
+        x = torch.empty(16, 32, 28, 28, dtype=torch.bfloat16)
+        for fn, expected in ((batch_norm, True), (statistics, False)):
+            gm = make_fx(fn, tracing_mode="fake")(x)
+            (node,) = [
+                n
+                for n in gm.graph.nodes
+                if n.target is torch.ops.aten.var_mean.correction
+            ]
+            with self.subTest(fn.__name__):
+                self.assertEqual(normalized_by(node), expected)
+
+    def test_reads_masked_parts(self):
+        # A var_mean over a cat of channels reads its masked parts, also
+        # through a dtype conversion; one over a plain tensor does not.
+        def cat_statistics(a, b):
+            return torch.var_mean(torch.cat([a, b], 1).float(), [0, 2, 3])
+
+        def statistics(a, b):
+            return torch.var_mean((a * 2).float(), [0, 2, 3])
+
+        a = torch.empty(4, 16, 14, 14, dtype=torch.bfloat16)
+        b = torch.empty(4, 8, 14, 14, dtype=torch.bfloat16)
+        for fn, expected in ((cat_statistics, True), (statistics, False)):
+            gm = make_fx(fn, tracing_mode="fake")(a, b)
+            (node,) = [
+                n
+                for n in gm.graph.nodes
+                if n.target is torch.ops.aten.var_mean.correction
+            ]
+            with self.subTest(fn.__name__):
+                self.assertEqual(reads_masked_parts(node), expected)
 
 
 if __name__ == "__main__":

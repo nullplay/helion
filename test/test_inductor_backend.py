@@ -892,6 +892,13 @@ def check_unequal_cat_segment_loops(
     test.assertIsNone(re.search(r"hl\.tile\(\[\d+, 3\]\)", source))
 
 
+def batch_norm_relu(x, mean, var, weight, bias):
+    """A training BatchNorm with its running statistics updated in place,
+    then a ReLU."""
+    y = torch.nn.functional.batch_norm(x, mean, var, weight, bias, True, 0.1)
+    return torch.relu(y), mean, var
+
+
 def check_window_spans(test: InductorBackendTestCase, backend: str) -> None:
     """Swin's residual LayerNorm, roll by 3 and window partition over a [2, 14,
     14, 128] bf16 image: the window kernel reads the rolled tokens, whose
@@ -1353,6 +1360,129 @@ class TestInductorCute(InductorBackendTestCase):
 
     def test_unequal_cat_segment_loops(self):
         check_unequal_cat_segment_loops(self, "cute")
+
+    def test_batch_norm_unrolls_runs(self):
+        # A training BatchNorm over an NCHW [4, 32, 14, 14] bf16, its running
+        # statistics updated in place: one persistent kernel over the 32
+        # channels that reads each image's run of 196 as a load of its own
+        # (HelionKernel.rdim_runs(), unroll_runs()) and sums the runs' values
+        # elementwise before each reduction, where the flat rdim of 784 read
+        # each element at r // 196 and r % 196.
+        x = torch.randn(4, 32, 14, 14, device=DEVICE, dtype=torch.bfloat16)
+        mean, var = torch.zeros(32, device=DEVICE), torch.ones(32, device=DEVICE)
+        weight, bias = torch.randn(32, device=DEVICE), torch.randn(32, device=DEVICE)
+        expected = batch_norm_relu(x.float(), mean.clone(), var.clone(), weight, bias)
+        expected = (expected[0].to(x.dtype), *expected[1:])
+        sources = self.compile(
+            batch_norm_relu,
+            x,
+            mean,
+            var,
+            weight,
+            bias,
+            expected=expected,
+            tol=2e-2,
+            backend="cute",
+        )
+        (source,) = [s for s in sources if "hl.tile(32)" in s]
+        self.assertRegex(source, r"in\d+\[tile_x, 3, :\]")
+        self.assertNotIn("tile_q", source)
+
+    def test_batch_norm_unrolls_runs_over_the_layout_split(self):
+        # 1.2M values over rdims of 12544, which the layout split would take
+        # (HelionChoices.layout_split_pays()): one kernel all the same, its 16
+        # runs unrolled (HelionChoices.reads_runs()), where the statistics
+        # alone keep the split's kernels.
+        x = torch.randn(16, 96, 28, 28, device=DEVICE, dtype=torch.bfloat16)
+        w, b = torch.randn(96, device=DEVICE), torch.randn(96, device=DEVICE)
+
+        def bn_affine(x, w, b):
+            y = torch.nn.functional.batch_norm(x, None, None, w, b, True)
+            return torch.relu(y)
+
+        (source,) = self.compile(bn_affine, x, w, b, tol=2e-2, backend="cute")
+        self.assertRegex(source, r"in\d+\[tile_x, 15, :\]")
+        stats = lambda x: torch.var_mean(x, [0, 2, 3], correction=0)  # noqa: E731
+        self.assertGreater(len(self.compile(stats, x, tol=1e-2, backend="cute")), 1)
+
+    def test_batch_norm_reads_flat_where_runs_do_not_unroll(self):
+        # Over a cat of 16 + 8 channels (DenseNet's), whose parts the kernel
+        # loads behind masks (HelionKernel.rdim_runs(), masked_parts()), over
+        # an input plus a value of each run's elements alone, the same in
+        # every run (broadcast_run_loads(), HelionKernel.runs_unroll()), and
+        # beside an amax over its runs, which unroll_runs() leaves alone
+        # (HelionScheduling.create_kernel_choices()): the kernel reads its
+        # rdim flat, where the tile of the runs would not compile.
+        parts = [
+            torch.randn(4, 16, 14, 14, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(4, 8, 14, 14, device=DEVICE, dtype=torch.bfloat16),
+        ]
+        mean, var = torch.zeros(24, device=DEVICE), torch.ones(24, device=DEVICE)
+        weight, bias = torch.randn(24, device=DEVICE), torch.randn(24, device=DEVICE)
+
+        def densenet(a, b, mean, var, weight, bias):
+            return batch_norm_relu(torch.cat([a, b], 1), mean, var, weight, bias)
+
+        floats = [part.float() for part in parts]
+        expected = densenet(*floats, mean.clone(), var.clone(), weight, bias)
+        expected = (expected[0].to(torch.bfloat16), *expected[1:])
+        sources = self.compile(
+            densenet,
+            *parts,
+            mean,
+            var,
+            weight,
+            bias,
+            expected=expected,
+            tol=2e-2,
+            backend="cute",
+        )
+        x = torch.randn(4, 32, 14, 14, device=DEVICE)
+        w = torch.randn(32, device=DEVICE)
+        heights = torch.randn(1, 1, 14, 1, device=DEVICE)
+
+        # An index of each run's 196 elements, a height index (r // 14) % 14,
+        # which is the same at a run's first two elements and the next run's
+        # first, and a load of the heights' values at that index: each the
+        # same in every run (HelionKernel.runs_unroll()).
+        for positions in (
+            lambda x, h: torch.arange(196, device=x.device).view(1, 1, 14, 14),
+            lambda x, h: torch.arange(14, device=x.device).view(1, 1, 14, 1),
+            lambda x, h: h,
+        ):
+
+            def bn_positions(x, w, h, mean, var, weight, bias, positions=positions):
+                y = x + w.view(1, 32, 1, 1) * positions(x, h)
+                return batch_norm_relu(y, mean, var, weight, bias)
+
+            mean, var = torch.zeros(32, device=DEVICE), torch.ones(32, device=DEVICE)
+            weight, bias = (
+                torch.randn(32, device=DEVICE),
+                torch.randn(32, device=DEVICE),
+            )
+            args = (x, w, heights)
+            expected = bn_positions(*args, mean.clone(), var.clone(), weight, bias)
+            sources += self.compile(
+                bn_positions,
+                *args,
+                mean,
+                var,
+                weight,
+                bias,
+                expected=expected,
+                tol=1e-3,
+                backend="cute",
+            )
+        x = torch.randn(4, 64, 14, 14, device=DEVICE)
+
+        def bn_amax(x):
+            var, mean = torch.var_mean(x, [0, 2, 3], correction=0, keepdim=True)
+            return (x - mean) * torch.rsqrt(var + 1e-5), x.amax([0, 2, 3])
+
+        sources += self.compile(bn_amax, x, tol=1e-4, backend="cute")
+        code = "\n".join(sources)
+        self.assertNotIn("tile_q", code)
+        self.assertNotRegex(code, r"in\d+\[tile_x, \d+, :\]")
 
     def test_short_rdims_stay_unsplit(self):
         # 1.6M values over rdims of 1568, which the CuTe backend's unsplit

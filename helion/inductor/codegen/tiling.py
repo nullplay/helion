@@ -11,6 +11,7 @@ from torch._inductor.codegen.simd_kernel_features import EnableReduction
 from torch._inductor.loop_body import MemoryUsageType
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import FloorDiv
 from torch.utils._sympy.functions import Identity
 from torch.utils._sympy.functions import ModularIndexing
@@ -442,6 +443,79 @@ def broadcast_runs(
     return False
 
 
+def broadcast_run_loads(
+    node_schedule: list[NodeScheduleEntry],
+    numel: sympy.Expr,
+    reduction_numel: sympy.Expr,
+    runs: tuple[int, int],
+) -> bool:
+    """Whether a load or an index expression of the kernel reads a value
+    that varies along the elements of a run but not along the runs
+    (reduction_runs(): Q runs of W elements, the flat rdim r = W * q + w):
+    the part of a cat of BatchNorm inputs that is expanded along N, read at
+    w + W*c whatever q, or an index of w alone, as of
+    torch.arange(196).view(1, 1, 14, 14) added to an NCHW [4, 32, 14, 14]
+    before its BatchNorm. Read as the runs' tile, its tile is [x, r] beside
+    the runs' [x, q, r], which unroll_runs() cannot tell from the runs' own:
+    an [x] value that meets it is reshaped to [tile_x, 1], and the unroll
+    would drop that 1 as the runs' dim,
+
+        tmp2 = hl.arange(rdim).to(torch.float32)
+        tmp3 = tmp1.reshape([tile_x])        # was tmp1.reshape([tile_x, 1])
+        tmp4 = tmp3 * tmp2                   # [tile_x] against [rdim]
+
+    which does not compile. A load of a buffer a node of the kernel writes is
+    that node's value, and a node whose sizes are not constants counts as one
+    that has such a load. The test samples each index at a run's first
+    element, its second and the next run's first, and so declines before a
+    probe; HelionKernel.runs_unroll() tests the probed kernel's values
+    exactly (an index that varies along a run but is equal at those three,
+    as a height index (r // 14) % 14 over runs of 196, reaches it)."""
+    numel_int, rnumel_int = static_int(numel), static_int(reduction_numel)
+    if numel_int is None or rnumel_int is None:
+        return True
+    _, run = runs
+    if run <= 1:
+        return False
+    xs = sorted({0, numel_int // 2, numel_int - 1})
+    written: OrderedSet[str] = OrderedSet()
+    for node in EnableReduction.filter(node_schedule):
+        if not isinstance(node, SchedulerNode):
+            continue
+        body = node._body
+        variables = [*body.iter_vars, *body.reduce_vars]
+        sizes = [static_int(body.var_ranges[var]) for var in variables]
+        if any(size is None for size in sizes):
+            return True
+        spans: dict[sympy.Symbol, tuple[int, int]] = {}
+        step = 1
+        for var, size in reversed([*zip(variables, sizes, strict=True)]):
+            spans[var] = (step, size)  # pyrefly: ignore [unsupported-operation]
+            step *= size  # pyrefly: ignore [unsupported-operation]
+        for entry in (
+            *body.memory_usage[MemoryUsageType.LOAD],
+            *body.memory_usage[MemoryUsageType.INDEX_EXPR],
+        ):
+            if entry.buffer_name in written:
+                continue
+            index = body.indexing_exprs[entry.index_name].replace(
+                Identity, lambda arg: arg
+            )
+            assert isinstance(index, sympy.Expr)
+            at = [_value_at(index, spans, x * rnumel_int) for x in xs]
+            along_w = [_value_at(index, spans, x * rnumel_int + 1) for x in xs]
+            along_q = [_value_at(index, spans, x * rnumel_int + run) for x in xs]
+            if at != along_w and at == along_q:
+                return True
+        for entry in (
+            *body.memory_usage[MemoryUsageType.STORE],
+            *body.memory_usage[MemoryUsageType.STORE_REDUCTION],
+        ):
+            if entry.buffer_name is not None:
+                written.add(entry.buffer_name)
+    return False
+
+
 def _value_at(
     index: sympy.Expr, spans: dict[sympy.Symbol, tuple[int, int]], flat: int
 ) -> object:
@@ -456,10 +530,11 @@ def reduction_runs(
     node_schedule: list[NodeScheduleEntry],
     numel: sympy.Expr,
     reduction_numel: sympy.Expr,
+    max_runs: int = REDUCTION_RUNS_MAX,
 ) -> tuple[int, int] | None:
     """The runs a kernel reduces over, (Q, W): Q runs of W elements, when its
     rdim is two dims (natural_tiling()) whose outer one has 2 to
-    REDUCTION_RUNS_MAX elements, as the sum over N and W of a [4, 1024, 364]
+    `max_runs` (REDUCTION_RUNS_MAX) elements, as the sum over N and W of a [4, 1024, 364]
     tensor reduces 4 runs of 364 elements for each of the 1024 channels.
     HelionKernel reads the runs as a tile of its outer loop beside one run of
     the rdim (HelionKernel.rdim_runs()), at an index affine in both where the
@@ -472,6 +547,6 @@ def reduction_runs(
     if len(reduction_dims) != 2:
         return None
     runs, run = (static_int(size) for size in reduction_dims)
-    if runs is None or run is None or not 2 <= runs <= REDUCTION_RUNS_MAX:
+    if runs is None or run is None or not 2 <= runs <= max_runs:
         return None
     return runs, run
