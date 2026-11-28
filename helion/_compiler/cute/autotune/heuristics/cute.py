@@ -38,6 +38,7 @@ from torch.fx import Node
 
 from ....._utils import prev_power_of_2
 from .....autotuner.config_spec import _CUTE_LANE_UNROLL_CHOICES
+from .....autotuner.config_spec import _CUTE_VECTOR_WIDTH_CHOICES
 from .....autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from .....autotuner.config_spec import get_valid_eviction_policies
 from .....language._gelu_tanh_approx import _gelu_erf
@@ -7391,34 +7392,71 @@ def _stride_one_loads(
         value = node.meta.get("val")
         if not (isinstance(tensor, torch.Tensor) and isinstance(value, torch.Tensor)):
             continue
-        sizes: list[sympy.Expr | None] = []
-        position = 0
-        for index in node.args[1]:
-            if index is None:
-                position += 1
-                continue
-            val = index.meta.get("val") if isinstance(index, torch.fx.Node) else index
-            size = value.shape[position] if position < value.ndim else None
-            if isinstance(val, int) or (
-                isinstance(val, torch.SymInt)
-                and not (
-                    isinstance(size, torch.SymInt)
-                    and _symint_sympy_expr(size) == _symint_sympy_expr(val)
-                )
-            ):
-                # A scalar index, not a tile: the value has no such dimension.
-                sizes.append(None)
-                continue
-            if isinstance(val, torch.Tensor) and val.ndim != 1:
-                break
-            position += 1
-            sizes.append(
-                _symint_sympy_expr(size) if isinstance(size, torch.SymInt) else None
-            )
-        else:
-            if position == value.ndim and len(sizes) == tensor.ndim:
-                loads.extend((tensor, sizes, unit) for unit in _unit_dims(tensor))
+        sizes = _subscript_sizes(tensor, value, node.args[1])
+        if sizes is not None:
+            loads.extend((tensor, sizes, unit) for unit in _unit_dims(tensor))
     return loads
+
+
+def _stride_one_stores(
+    graph: torch.fx.Graph,
+) -> list[tuple[torch.Tensor, list[sympy.Expr | None], int]]:
+    """``_stride_one_loads`` for the stores of ``graph``: ``(tensor, sizes,
+    unit_dim)`` with the stored value's sizes per dimension of the tensor."""
+    stores = []
+    for node in graph.nodes:
+        if (
+            node.op != "call_function"
+            or node.target is not language_store
+            or len(node.args) < 3
+            or not isinstance(node.args[0], torch.fx.Node)
+            or not isinstance(node.args[1], (list, tuple))
+            or not isinstance(node.args[2], torch.fx.Node)
+        ):
+            continue
+        tensor = node.args[0].meta.get("val")
+        value = node.args[2].meta.get("val")
+        if not (isinstance(tensor, torch.Tensor) and isinstance(value, torch.Tensor)):
+            continue
+        sizes = _subscript_sizes(tensor, value, node.args[1])
+        if sizes is not None:
+            stores.extend((tensor, sizes, unit) for unit in _unit_dims(tensor))
+    return stores
+
+
+def _subscript_sizes(
+    tensor: torch.Tensor, value: torch.Tensor, indices: Sequence[object]
+) -> list[sympy.Expr | None] | None:
+    """The sizes of ``value``, a load's or a store's, per dimension of
+    ``tensor`` as ``_stride_one_loads`` aligns them through the subscripts
+    ``indices``, or None when they do not align."""
+    sizes: list[sympy.Expr | None] = []
+    position = 0
+    for index in indices:
+        if index is None:
+            position += 1
+            continue
+        val = index.meta.get("val") if isinstance(index, torch.fx.Node) else index
+        size = value.shape[position] if position < value.ndim else None
+        if isinstance(val, int) or (
+            isinstance(val, torch.SymInt)
+            and not (
+                isinstance(size, torch.SymInt)
+                and _symint_sympy_expr(size) == _symint_sympy_expr(val)
+            )
+        ):
+            # A scalar index, not a tile: the value has no such dimension.
+            sizes.append(None)
+            continue
+        if isinstance(val, torch.Tensor) and val.ndim != 1:
+            return None
+        position += 1
+        sizes.append(
+            _symint_sympy_expr(size) if isinstance(size, torch.SymInt) else None
+        )
+    if position == value.ndim and len(sizes) == tensor.ndim:
+        return sizes
+    return None
 
 
 def _packet_lanes(
@@ -7604,6 +7642,191 @@ class CuteGridLaneJamHeuristic(AutotunerHeuristic):
             "cute_grid_lane_jam": True,
         }
         return Config(**seed)
+
+
+# Threads along the lane axis of a ``CuteJammedColumnStoreHeuristic`` seed,
+# each with one packet's lanes: 8 and 4 (x tiles of 64 and 32 bf16 columns),
+# then the fallbacks that keep a seed at every static shape.
+_COLUMN_STORE_THREADS = (8, 4)
+_COLUMN_STORE_FALLBACK_THREADS = (2, 1)
+# The CTA a ``CuteJammedColumnStoreHeuristic`` seed may ask for.
+_COLUMN_STORE_MAX_THREADS = 1024
+
+
+class CuteJammedColumnStoreHeuristic(AutotunerHeuristic):
+    """Seed jammed lanes where a device loop loads along its own axis and
+    stores along a grid axis.
+
+    better-benchmark's 471fe712 (``out0[y, r, x] = in0[y, r, x] * c`` and the
+    sum over r) reads ``in0`` contiguous along r and writes ``out0``
+    contiguous along x.  Its searched configs put one x per thread and r on
+    32-byte packets: every ``out0`` store is 2 bytes, the warp's store
+    requests outnumber its loads by 16 to 1 and it stalls on the store queue
+    (ncu: lg_throttle 3083 cycles per warp against Triton's 86).  This seed
+    gives each thread one packet's x as blocked grid lanes (8 bf16), puts the
+    loop's chunk on threads of 32-byte packets along r and turns on
+    ``cute_grid_lane_jam``: the lanes' loads of one x stay 32-byte packets
+    along r, and the lanes' stores of one r become one 16-byte packet along
+    x (``jam_grid_lanes._vectorize_stores``), a transpose in registers.  On a
+    GB300 that took 471fe712's kernel from 16.2-17.4 us to 14.3 (64 columns
+    on 8 threads) and G02's 687c0b28 from 4.98 to 4.58 (32 on 4); two seeds
+    give both tiles.  It plants where a tile loop directly in the root loads
+    a tensor whose stride-1 dimension the loop walks and stores a tensor
+    whose stride-1 dimension a grid axis tiles (``_plan``), at every static
+    shape: the tiles that divide the lane axis, else the widest of
+    ``_COLUMN_STORE_FALLBACK_THREADS`` that does (one thread of
+    ``_packet_lanes`` lanes always does), so that the knob is searchable at
+    every shape (``autotune_multi`` needs one search space).  The loop's
+    packets are the widest the target moves (32 bytes from sm_100, 16
+    before), and a seed's CTA stays within ``_COLUMN_STORE_MAX_THREADS``.
+    The jam proves the rest and leaves anything else rolled."""
+
+    name = "cute_jammed_column_store"
+    backend = "cute"
+    priority = 108
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, int, int] | None:
+        """``(lane_block, lanes, loop_block, width)``: the grid axis whose
+        tile a device loop's store has on its tensor's stride-1 dimension,
+        the lanes of one packet of that tensor along it, the loop's block and
+        the loop's vector width (the target's widest packet of the tensors it
+        loads along its own axis, within the vector width choices).  One
+        root, one device loop directly in it, both a walked load and such a
+        store in the loop, static lanes; None else."""
+        from ....device_ir import ForLoopGraphInfo
+        from ....device_ir import ReductionLoopGraphInfo
+
+        spec = env.config_spec
+        if (
+            spec.matmul_facts
+            or spec.reduction_loops
+            or len(device_ir.grid_block_ids) != 1
+        ):
+            return None
+        grid = device_ir.grid_block_ids[0]
+        paths = tile_loop_paths(device_ir, device_ir.graphs)
+        if not paths or any(len(path) != 2 or len(path[1]) != 1 for path in paths):
+            return None
+        symbols = {
+            _symint_sympy_expr(env.block_sizes[block_id].var): block_id
+            for block_id in grid
+        }
+        loops = [
+            graph
+            for graph in device_ir.graphs
+            if isinstance(graph, ForLoopGraphInfo)
+            and not isinstance(graph, ReductionLoopGraphInfo)
+            and len(graph.block_ids) == 1
+        ]
+        if len(loops) != 1:
+            return None
+        (loop,) = loops
+        loop_block = loop.block_ids[0]
+        loop_symbol = _symint_sympy_expr(env.block_sizes[loop_block].var)
+        walked = [
+            tensor
+            for tensor, sizes, unit in _stride_one_loads(loop.graph)
+            if sizes[unit] == loop_symbol
+        ]
+        stored: list[tuple[int, torch.Tensor, int]] = []
+        for tensor, sizes, unit in _stride_one_stores(loop.graph):
+            symbol = sizes[unit]
+            if symbol is not None and symbol in symbols:
+                stored.append((symbols[symbol], tensor, unit))
+        if not walked or not stored:
+            return None
+        lane_block, tensor, unit = stored[0]
+        lanes = _packet_lanes(env, tensor, unit, lane_block)
+        if lanes is None:
+            return None
+        # One packet of the widest the target moves (32 bytes from sm_100,
+        # 16 before) per lane of the loop, within the vector width choices.
+        packet_bytes = target_facts.widest_packet_bytes(spec.target_device_capability)
+        width = max(
+            1,
+            min(
+                max(_CUTE_VECTOR_WIDTH_CHOICES),
+                *(packet_bytes // walk.dtype.itemsize for walk in walked),
+            ),
+        )
+        return lane_block, lanes, loop_block, width
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        spec = env.config_spec
+        return cls._plan(env, device_ir) is not None and all(
+            item.block_id in sequence.valid_block_ids()
+            for sequence in (spec.num_threads, spec.cute_vector_widths)
+            for item in spec.block_sizes
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        lane_block, lanes, loop_block, width = plan
+        spec = env.config_spec
+        extents = {item.block_id: item.size_hint for item in spec.block_sizes}
+        chunk = _key_chunk(extents[loop_block], width)
+        loop_threads = max(1, chunk // width)
+
+        def fits(lane_threads: int) -> bool:
+            # The jam needs the lane axis unmasked (a tile that divides it),
+            # and the CTA no more than its thread limit.
+            return (
+                extents[lane_block] % (lanes * lane_threads) == 0
+                and lane_threads * loop_threads <= _COLUMN_STORE_MAX_THREADS
+            )
+
+        choices = [t for t in _COLUMN_STORE_THREADS if fits(t)]
+        if not choices:
+            # A seed at every static shape keeps the knob searchable there
+            # (``autotune_multi`` needs one search space): the widest
+            # fallback the lane axis takes unmasked (one thread of
+            # ``lanes``, which divide it, always does).
+            choices = [next(t for t in _COLUMN_STORE_FALLBACK_THREADS if fits(t))]
+        seeds: list[Config] = []
+        for lane_threads in choices:
+            tile = lanes * lane_threads
+            blocks: dict[int, int] = {}
+            threads: dict[int, int] = {}
+            widths: dict[int, int] = {}
+            layouts: dict[int, str] = {}
+            for item in spec.block_sizes:
+                block_id = item.block_id
+                layouts[block_id] = "blocked"
+                if block_id == lane_block:
+                    blocks[block_id] = tile
+                    threads[block_id] = lane_threads
+                elif block_id == loop_block:
+                    blocks[block_id] = chunk
+                    threads[block_id] = loop_threads
+                    widths[block_id] = min(width, chunk)
+                else:
+                    blocks[block_id] = 1
+                    threads[block_id] = 1
+            seed: dict[str, Any] = {
+                "block_sizes": [blocks[item.block_id] for item in spec.block_sizes],
+                "num_threads": _seq_config_list(spec.num_threads, threads),
+                "cute_vector_widths": _seq_config_list(spec.cute_vector_widths, widths),
+                "cute_lane_layouts": _seq_config_list(spec.cute_lane_layouts, layouts),
+                "cute_grid_lane_jam": True,
+            }
+            seeds.append(Config(**seed))
+        return seeds
 
 
 # The operations whose results ``fuse_two_pass_loads`` carries from a looped

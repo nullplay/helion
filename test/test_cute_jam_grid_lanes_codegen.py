@@ -26,6 +26,9 @@ from helion._compiler.backend_registry import repair_backend_codegen
 from helion._compiler.cute import atomic_ops
 from helion._compiler.cute._ast_pass_utils import EXACT_DIVISION_HELPERS
 from helion._compiler.cute.autotune.heuristics.cute import CuteGridLaneJamHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteJammedColumnStoreHeuristic,
+)
 from helion._compiler.cute.autotune.heuristics.cute import CuteReductionLaneJamHeuristic
 from helion._compiler.device_ir import ReductionLoopGraphInfo
 from helion._testing import cpu_render_target
@@ -1518,3 +1521,102 @@ def test_a_column_tail_keeps_the_rolled_lanes(n_c: int) -> None:
     assert "for lane_1 in range(8)" in code
     assert "_cute_store_u16_vec(" not in code
     assert ").store(" in code
+
+
+def _column_store_bound(
+    n_c: int = 64, dtype: torch.dtype = torch.bfloat16
+) -> helion.runtime.kernel.BoundKernel:
+    """``scaled_copy_and_sum`` over ``[2, 128, n_c]`` bound on CPU, in the
+    caller's ``cpu_render_target``."""
+    kernel = helion.kernel(
+        scaled_copy_and_sum, backend="cute", static_shapes=True, autotune_effort="none"
+    )
+    return cpu_bind(kernel, transposed_sum_inputs(2, n_c, dtype))
+
+
+def _column_store_seeds(
+    bound: helion.runtime.kernel.BoundKernel,
+) -> list[helion.Config] | None:
+    """``CuteJammedColumnStoreHeuristic``'s seeds for ``bound``, asked
+    directly (``_jam_plan``'s reason)."""
+    return CuteJammedColumnStoreHeuristic.get_seed_configs(
+        bound.env, bound.host_function.device_ir
+    )
+
+
+def test_a_column_store_beside_a_walked_load_gets_two_jam_seeds() -> None:
+    # The r loop loads x along r (its own axis) and stores out along the
+    # column axis: eight blocked column lanes on 8 or 4 threads, r on threads
+    # of 32-byte packets (16 bf16), the jam on.  Both seeds render the
+    # columns' stores of one r as packets.
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        bound = _column_store_bound()
+        seeds = _column_store_seeds(bound)
+        assert seeds is not None
+        configs = [seed.config for seed in seeds]
+        assert [c["block_sizes"] for c in configs] == [[1, 64, 128], [1, 32, 128]]
+        assert [c["num_threads"] for c in configs] == [[1, 8, 8], [1, 4, 8]]
+        for config in configs:
+            assert config["cute_vector_widths"] == [1, 1, 16]
+            assert config["cute_lane_layouts"] == ["blocked"] * 3
+            assert config["cute_grid_lane_jam"] is True
+        for seed in seeds:
+            code = bound.to_code(seed)
+            assert "for lane_1 in range(" not in code
+            assert code.count("_cute_store_u16_vec(") == 1
+            assert ").store(" not in code
+    # fp32: 4 lanes of 4 bytes, on 8 or 4 threads; r packets of 8.
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        bound = _column_store_bound(dtype=torch.float32)
+        seeds = _column_store_seeds(bound)
+        assert seeds is not None
+        configs = [seed.config for seed in seeds]
+        assert [c["block_sizes"] for c in configs] == [[1, 32, 128], [1, 16, 128]]
+        assert all(c["cute_vector_widths"] == [1, 1, 8] for c in configs)
+        for seed in seeds:
+            code = bound.to_code(seed)
+            assert "_cute_store_u32_vec(" in code
+            assert ").store(" not in code
+
+
+@pytest.mark.parametrize(("n_c", "tile"), [(36, 4), (40, 8)])
+def test_the_column_store_seed_keeps_the_search_space_at_any_extent(
+    n_c: int, tile: int
+) -> None:
+    # 36 or 40 columns: no tile of 4 or 8 threads divides them, so the seed
+    # falls back to one thread of one packet's lanes (4 bf16 lanes for
+    # 36, 8 for 40), which does; the knob stays searchable, and the search
+    # space is the 64-column kernel's (``autotune_multi`` compares them).
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        bound = _column_store_bound(n_c)
+        seeds = _column_store_seeds(bound)
+        assert seeds is not None
+        assert [seed.config["block_sizes"] for seed in seeds] == [[1, tile, 128]]
+        assert [seed.config["num_threads"] for seed in seeds] == [[1, 1, 8]]
+        fingerprint = _column_store_bound(64).config_spec.structural_fingerprint()
+        # Searchable at 64 columns (without a jam seed the search choices
+        # are only False), and the same at 36 and 40.
+        knob = ("cute_grid_lane_jam", "enum", "False", "True")
+        assert (*knob, "search", "False", "True") in fingerprint
+        assert bound.config_spec.structural_fingerprint() == fingerprint
+
+
+def test_no_column_store_seed_without_a_store_along_a_grid_axis() -> None:
+    # row_norm's loops store along their own axis, T5's softmax along keys:
+    # no store of a grid axis's stride-1 dimension inside a loop.
+    kernel = helion.kernel(
+        row_norm, backend="cute", static_shapes=True, autotune_effort="none"
+    )
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        bound = cpu_bind(kernel, (torch.empty(64, 2048, dtype=torch.bfloat16),))
+        plan = CuteJammedColumnStoreHeuristic._plan(
+            bound.env, bound.host_function.device_ir
+        )
+        assert plan is None
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        bound = _bind(256)
+        assert _jam_plan(bound) is not None
+        plan = CuteJammedColumnStoreHeuristic._plan(
+            bound.env, bound.host_function.device_ir
+        )
+        assert plan is None
