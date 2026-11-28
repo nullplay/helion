@@ -15,7 +15,9 @@ import torch
 import helion
 from helion import exc
 from helion._compiler.cute.hoist_warp_reduce import hoist_warp_reduce_from_vloop
+from helion._testing import DEVICE
 from helion._testing import cpu_render_target
+from helion._testing import skipIfNotCUDA
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
@@ -240,24 +242,72 @@ def _welford_with_copy(
         out_m2[tile_x] = acc1
 
 
-@pytest.mark.parametrize("vector", [1, 4])
-def test_a_welford_chunk_loop_that_stores_is_not_split_by_vector_lanes(
-    vector: int,
-) -> None:
-    """With one element per lane the Welford of each chunk is the chunk's;
-    as four vector lanes beside the copy's stores, each lane's block sum
-    would be read as the chunk's (on GB300 the mean of 3136 values of x + 1
-    came out 0.2): the config is refused."""
-    x = torch.empty(4 * 8 * 96, dtype=torch.float32)
-    args = (x, torch.empty_like(x), torch.empty(8), torch.empty(8))
-    config = helion.Config(
+def _welford_config(vector: int) -> helion.Config:
+    return helion.Config(
         block_sizes=[1, 512], num_threads=[1, 128], cute_vector_widths=[1, vector]
     )
+
+
+@pytest.mark.parametrize("vector", [1, 4])
+def test_a_welford_chunk_loop_that_stores_apart_folds_its_vector_lanes(
+    vector: int,
+) -> None:
+    """The copy's tensor is apart from x (two allocations): the chunk's two
+    reductions fold over the vector lanes, one block reduction each, and
+    the copy's stores run in the first fold loop
+    (KernelTensors.store_keeps_loads())."""
+    x = torch.empty(4 * 8 * 96, dtype=torch.float32)
+    args = (x, torch.empty_like(x), torch.empty(8), torch.empty(8))
     with cpu_render_target(reduction_smem_budget_bytes=232448):
         bound = cpu_bind(_welford_with_copy, args)
-        config = bound.config_spec.normalized_config(config)
-        if vector == 1:
-            assert "_cute_grouped_reduce" in bound.to_code(config)
-            return
+        code = bound.to_code(
+            bound.config_spec.normalized_config(_welford_config(vector))
+        )
+    assert code.count("_cute_grouped_reduce_shared_two_stage(") == 2, code
+    if vector > 1:
+        assert "_helion_vfold_acc_1" in code, code
+
+
+def test_a_welford_chunk_loop_that_may_store_into_its_input_is_refused() -> None:
+    """The copy may write x itself (the same tensor passed twice): a second
+    fold loop would read the stored values, so the loop keeps its lanes, and
+    each lane's block sum would be read as the chunk's (on GB300 the mean of
+    3136 values of x + 1 came out 0.2): the config is refused."""
+    x = torch.empty(4 * 8 * 96, dtype=torch.float32)
+    args = (x, x, torch.empty(8), torch.empty(8))
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        bound = cpu_bind(_welford_with_copy, args)
+        config = bound.config_spec.normalized_config(_welford_config(4))
         with pytest.raises(exc.BackendUnsupported, match="the tile's extent"):
             bound.to_code(config)
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+def test_cuda_welford_chunk_loop_that_stores_apart_matches_eager() -> None:
+    """The folded Welford beside the copy's stores: the copy, the mean and
+    m2 of each channel of an NCHW [4, 8, 96] (one partial last chunk of
+    the 384 values at a block of 256) match eager."""
+    kernel = helion.kernel(
+        _welford_with_copy.fn,
+        backend="cute",
+        static_shapes=True,
+        config=helion.Config(
+            block_sizes=[1, 256], num_threads=[1, 64], cute_vector_widths=[1, 4]
+        ),
+    )
+    image = torch.randn(4, 8, 96, device=DEVICE) + 1.0
+    x = image.reshape(-1)
+    copy = torch.empty_like(x)
+    mean = torch.empty(8, device=DEVICE)
+    m2 = torch.empty(8, device=DEVICE)
+    kernel(x, copy, mean, m2)
+    torch.testing.assert_close(copy, x, rtol=0, atol=0)
+    channels = image.permute(1, 0, 2).reshape(8, -1)
+    torch.testing.assert_close(mean, channels.mean(-1), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(
+        m2,
+        ((channels - channels.mean(-1, keepdim=True)) ** 2).sum(-1),
+        rtol=1e-4,
+        atol=1e-4,
+    )

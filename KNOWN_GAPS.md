@@ -309,8 +309,11 @@ these labelled lines.
   `count` are per-row values (`hl.zeros` of `[tile_m]`) that start ahead of
   the column loop and are stored after it. (The store and one reduction,
   `total = v.sum(-1)` alone, fold since the pass runs a loop's stores in its
-  fold loop. Inductor's looped Welford beside a store, whose per-lane merge
-  reads the tile's count, `tile_r.end - tile_r.begin`, is refused:
+  fold loop, and so do a store and several reductions when the store's
+  tensor is proven apart from every tensor the loop reads:
+  `KernelTensors.store_keeps_loads()`. Inductor's looped Welford beside a
+  store that may write a tensor the loop reads, whose per-lane merge reads
+  the tile's count, `tile_r.end - tile_r.begin`, is refused:
   `_per_lane_reduce_escape()`.)
 
   ```python
