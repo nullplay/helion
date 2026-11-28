@@ -126,3 +126,138 @@ def test_a_tile_sum_read_per_element_is_not_split_by_vector_lanes(vector: int) -
             return
         with pytest.raises(exc.BackendUnsupported, match="vector lane loop"):
             bound.to_code(config)
+
+
+def test_a_partial_combined_with_the_tiles_extent_is_refused() -> None:
+    """Inductor's looped Welford, its V-loop kept by an element store beside
+    two reductions: each lane's sum, divided by the tile's count that the
+    statements ahead of the loop compute from tile_end, is taken for the
+    tile's mean and merged with the tile's weight once per lane."""
+    src = """
+    for tile_offset_1 in range(0, 3136, _BLOCK_SIZE_1):
+        tile_end = cutlass.Int32(tile_offset_1 + _BLOCK_SIZE_1)
+        count = cutlass.Float32(1.0 * (tile_end + -1 * tile_offset_1 + 0.0))
+        scale = 1.0 / (_BLOCK_SIZE_1 + 0.0)
+        weight = count * scale
+        share = count / (acc2 + count)
+        for vec_lane_1 in cutlass.range_constexpr(4):
+            v = cutlass.Float32(_v0[vec_lane_1])
+            (out0.iterator + cutlass.Int32(lane_base + vec_lane_1)).store(cutlass.BFloat16(v))
+            scaled = v * scale
+            s = cutlass.Float32(cute.arch.warp_reduction_sum(scaled, threads_in_group=32))
+            mean_c = s / weight
+            d = v - mean_c
+            square = d * d
+            m2_c = cutlass.Float32(cute.arch.warp_reduction_sum(square, threads_in_group=32))
+            acc = acc + (mean_c - acc) * share
+            acc1 = acc1 + m2_c
+        acc2 = acc2 + count
+    """
+    with pytest.raises(exc.BackendUnsupported, match="combined with the tile's extent"):
+        _hoist(src)
+
+
+def test_a_partial_combined_with_a_count_the_loop_computes_is_refused() -> None:
+    """The same merge with the tile's count computed inside the V-loop from
+    tile_end; a mask compared against tile_end (under a cast) is no count."""
+    src = """
+    for tile_offset_1 in range(0, 3136, _BLOCK_SIZE_1):
+        tile_end = cutlass.Int32(tile_offset_1 + _BLOCK_SIZE_1)
+        for vec_lane_1 in cutlass.range_constexpr(4):
+            v = cutlass.Float32(_v0[vec_lane_1])
+            (out0.iterator + cutlass.Int32(lane_base + vec_lane_1)).store(cutlass.BFloat16(v))
+            inside = cutlass.Boolean(lane_base + vec_lane_1 < tile_end)
+            kept = v if inside else cutlass.Float32(0)
+            s = cutlass.Float32(cute.arch.warp_reduction_sum(kept, threads_in_group=32))
+            count = cutlass.Float32(tile_end - tile_offset_1)
+            mean_c = s / count
+            d = v - mean_c
+            square = d * d
+            m2_c = cutlass.Float32(cute.arch.warp_reduction_sum(square, threads_in_group=32))
+            acc = acc + mean_c
+            acc1 = acc1 + m2_c
+    """
+    with pytest.raises(exc.BackendUnsupported, match=r"tile's extent \(count\)"):
+        _hoist(src)
+
+
+def test_a_sum_of_partials_of_scaled_elements_stays() -> None:
+    """Elements scaled by the tile's count ahead of their reduce: each lane's
+    partial is a sum, and adding every lane's into the carry gives the
+    tile's, so the loop stays (the partial is no extent of the tile)."""
+    src = textwrap.dedent(
+        """
+        for tile_offset_1 in range(0, 3136, _BLOCK_SIZE_1):
+            tile_end = cutlass.Int32(tile_offset_1 + _BLOCK_SIZE_1)
+            w = cutlass.Float32(1.0) / cutlass.Float32(tile_end - tile_offset_1)
+            for vec_lane_1 in cutlass.range_constexpr(4):
+                v = cutlass.Float32(_v0[vec_lane_1])
+                (out0.iterator + cutlass.Int32(lane_base + vec_lane_1)).store(cutlass.BFloat16(v))
+                t = v * w
+                s = cutlass.Float32(cute.arch.warp_reduction_sum(t, threads_in_group=32))
+                square = t * t
+                q = cutlass.Float32(cute.arch.warp_reduction_sum(square, threads_in_group=32))
+                total = total + s
+                total2 = total2 + q
+        """
+    )
+    assert _hoist(src) == ast.unparse(ast.parse(src))
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _welford_with_copy(
+    x: torch.Tensor, copy: torch.Tensor, out_mean: torch.Tensor, out_m2: torch.Tensor
+) -> None:
+    # Inductor's looped Welford of a BatchNorm over its NCHW rdim N * H * W
+    # (4 x 96 of each of 8 channels), whose chunk loop also copies the values
+    # it reads: x and copy are flat [4 * 8 * 96].
+    for tile_x in hl.tile(8):
+        acc = hl.zeros([tile_x], dtype=torch.float32)
+        acc1 = hl.zeros([tile_x], dtype=torch.float32)
+        acc2 = hl.zeros([tile_x], dtype=torch.float32)
+        for tile_r in hl.tile(384):
+            index = (
+                96 * tile_x.index.reshape([tile_x, 1])
+                + 768 * (tile_r.index // 96)
+                + tile_r.index % 96
+            )
+            v = x[index]
+            copy[index] = v
+            weight = 1.0 * (tile_r.end - tile_r.begin)
+            scale = 1.0 / tile_r.block_size
+            block_sum = torch.sum(v * scale, -1)
+            full = hl.full([], weight, dtype=torch.float32)
+            block_mean = block_sum / (full * scale)
+            d = v - block_mean.reshape([tile_x, 1])
+            block_m2 = torch.sum(d * d, -1)
+            new_weight = acc2 + weight
+            delta = torch.where(acc == block_mean, 0.0, block_mean - acc)
+            share = torch.where(new_weight == 0.0, 0.0, full / new_weight)
+            acc = acc + delta * share
+            acc1 = acc1 + block_m2 + delta * (acc2 * share) * delta
+            acc2 = new_weight
+        out_mean[tile_x] = acc
+        out_m2[tile_x] = acc1
+
+
+@pytest.mark.parametrize("vector", [1, 4])
+def test_a_welford_chunk_loop_that_stores_is_not_split_by_vector_lanes(
+    vector: int,
+) -> None:
+    """With one element per lane the Welford of each chunk is the chunk's;
+    as four vector lanes beside the copy's stores, each lane's block sum
+    would be read as the chunk's (on GB300 the mean of 3136 values of x + 1
+    came out 0.2): the config is refused."""
+    x = torch.empty(4 * 8 * 96, dtype=torch.float32)
+    args = (x, torch.empty_like(x), torch.empty(8), torch.empty(8))
+    config = helion.Config(
+        block_sizes=[1, 512], num_threads=[1, 128], cute_vector_widths=[1, vector]
+    )
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        bound = cpu_bind(_welford_with_copy, args)
+        config = bound.config_spec.normalized_config(config)
+        if vector == 1:
+            assert "_cute_grouped_reduce" in bound.to_code(config)
+            return
+        with pytest.raises(exc.BackendUnsupported, match="the tile's extent"):
+            bound.to_code(config)
