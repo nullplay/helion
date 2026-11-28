@@ -12,6 +12,7 @@ from typing import cast
 
 import sympy
 import torch
+from torch._inductor.choices import InductorChoices
 from torch._inductor.codegen.common import CSEProxy
 from torch._inductor.codegen.common import CSEVariable
 from torch._inductor.codegen.common import DeferredLine
@@ -26,6 +27,7 @@ from torch._inductor.ir import MutationLayoutSHOULDREMOVE
 from torch._inductor.ir import Reduction
 from torch._inductor.ir import ReinterpretView
 from torch._inductor.runtime.hints import ReductionHint
+from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.shape_propagation import ShapePropagationOpsHandler
 from torch._inductor.utils import IndentedBuffer
 from torch._inductor.utils import sympy_subs
@@ -2695,7 +2697,8 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         welford_reduce reduces x; welford_combine reduces the (mean, m2, weight)
         partials of a split reduction's first kernel. Each block of tile_r is
         reduced to its own weight, mean and m2, welford_reduce's in two sums
-        over the block in registers (the mean, then the deviations' spread),
+        over the block in registers (the mean, then the deviations' spread;
+        four in the corrected two-pass below),
         welford_combine's from its partials (their weights' sum, their weighted
         mean corrected by their deviations from it, their m2 plus the spread of
         their means), and folded into the accumulators acc_mean, acc_m2 and
@@ -2742,7 +2745,9 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             return total if empty is None else ops.where(empty, zero, total)
 
         # Two sums over each block, as Inductor's welford_reduce_fallback()
-        # reduces a persistent rdim: the mean, then m2, the deviations' spread.
+        # reduces a persistent rdim: the mean, then m2, the deviations' spread
+        # (four where the corrected two-pass below also sums the squares of
+        # x * s, and the deviations from the mean before m2).
         # As there, a mean that rounds leaves the deviations a mean of their
         # own: of 100000000 and 100000008 in turn, the mean 100000004 rounds to
         # 100000000, and the deviations 0 and 8 give the variance 32, where
@@ -2769,12 +2774,40 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             # B200 in the CuTe backend, and an rdim whose sum overflows (4096
             # values of 1e37) gets the mean inf and the variance inf, as from
             # those, where eager's Welford keeps them finite.
+            # A persistent rdim that Triton's rule would loop over, which the
+            # rereads_rdim() rule of HelionChoices reads as one block, keeps
+            # the loop's numerics: the scaled sum, so that 4096 values of 1e37
+            # get a finite mean (inf, and the normalized outputs nan,
+            # otherwise), and the corrected two-pass (below): an rdim of 3072
+            # values of 0.7 summed to a mean a float32 spacing off, whose
+            # deviations made the variance 7.6e-14 rather than 0 and a
+            # LayerNorm's outputs of 0 come out as +-2.5e-5, where eager's and
+            # the loop's Welford give 0. A persistent rdim of Triton's rule
+            # (asked as the kernel asks it, with its tiling scores) keeps its
+            # two-pass, as Triton's persistent reductions compute it, and so
+            # does a mix-order reduction's, which Inductor makes persistent
+            # itself (override_persistent_reduction).
+            corrected = (
+                self.persistent_reduction
+                and not self.mix_order_reduction
+                and not InductorChoices.should_use_persistent_reduction(
+                    self.features.with_tiling_scores(self.tiling_scores),
+                    self.cooperative_reduction,
+                )
+            )
             if self.persistent_reduction:
                 # The rdim is one block of R values: the number 300.0,
                 # rather than the sum of hl.full([], 1.0, ...).expand(rdim),
                 # which would name the rdim (rdim_code()).
-                weight = ops.constant(float(int(self.numels["r0_"])), dtype)
-                scale = None
+                rdim = int(self.numels["r0_"])
+                weight = ops.constant(float(rdim), dtype)
+                # 1 / B for B the power of two that holds R: the product x * s
+                # is exact, as the loop's is.
+                scale = (
+                    ops.constant(1.0 / next_power_of_2(rdim), dtype)
+                    if corrected
+                    else None
+                )
             else:
                 # The block's lanes within R (Helion masks the others): a
                 # scalar, where a sum of hl.full([], 1.0, ...).expand(tile_r)
@@ -2794,6 +2827,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                 # a 0-d tensor, and so are they.
                 if self.is_number(one):
                     self.numbers.update((weight.name, scale.name))
+            squares = bound = None
             if scale is None:
                 # A block sum of x that the rdim took before, as of
                 # torch.mean(x, -1) beside torch.var(x, -1), is the Welford
@@ -2804,9 +2838,92 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                 # keeps its own.
                 mean = ops.truediv(block_sum(value), weight)
             else:
-                total = block_sum(ops.mul(value, scale))
+                scaled = ops.mul(value, scale)
+                total = block_sum(scaled)
                 mean = ops.truediv(total, ops.mul(weight, scale))
+                if corrected:
+                    # The corrected two-pass's test (below): the sum of the
+                    # squares of x * s, a fourth block sum beside the first, and
+                    # its bound, 2 * sum(x * s) * mean(x * s).
+                    squares = block_sum(ops.mul(scaled, scaled))
+                    scaled_mean = ops.truediv(total, weight)
+                    bound = ops.mul(
+                        ops.constant(2.0, dtype), ops.mul(total, scaled_mean)
+                    )
             dev = ops.sub(value, mean)
+            if corrected:
+                # The corrected two-pass (Chan, Golub and LeVeque): the mean
+                # plus the mean of the deviations d from it, then m2 over the
+                # deviations from the corrected mean. An rdim of 2360:
+                #     tmp10 = tmp0 - tmp9                      # d
+                #     tmp11 = torch.sum(tmp10, -1)
+                #     ...
+                #     tmp16 = tmp11 / tmp2                     # tmp2 = 2360.0
+                #     tmp17 = tmp8 + tmp16
+                #     tmp18 = torch.where(tmp15, tmp17, tmp8)  # mean
+                #     tmp19 = tmp18.reshape([tile_x, 1])
+                #     tmp20 = tmp0 - tmp19
+                #     tmp21 = tmp20 * tmp20
+                #     tmp22 = torch.sum(tmp21, -1)             # m2
+                # A constant rdim's deviations are one value d, a few ulp of
+                # the constant at most, and the mean plus sum(d) / R, a
+                # division within 2 ulp of d, rounds to the constant: every
+                # deviation from it is 0, and so is m2, where the deviations d
+                # leave 3072 values of 0.55 * 2**100 (a mean a spacing of
+                # 2**76 off) the variance inf (d * d overflows). The corrected
+                # two-pass's own m2, sum(d * d) - sum(d) ** 2 / R, is inf - inf
+                # there, and sum((d - sum(d) / R) ** 2) keeps the division's
+                # error (3072 values of 0.55 * 2**78: the variance 2.9e17)
+                # unless it divides in float64, which cost up to 33% at the
+                # same configs on GB300. A mean that rounds even corrected
+                # leaves its rounding in m2: of 100000000 and 100000008 in
+                # turn, the mean 100000004 rounds to 100000000, and the
+                # variance is 32, as from the loop (eager's Welford gets the
+                # exact 16); of 1024 of each, 32 as from eager. Subtracting
+                # sum(x - mean) ** 2 / R as well gives 16 for both, at a fifth
+                # block sum (as a fourth, before the squares' sum below, it
+                # cost 1-4% at the same configs on GB300). A
+                # sum of the deviations that is not finite
+                # (deviations near 1e37 of both signs, or an inf or nan in the
+                # rdim) leaves the mean as it is. (Scaled deviations, x * s -
+                # mean * s, would not overflow but lose the bits of values
+                # within B of the subnormal range.)
+                shift = block_sum(dev)
+                finite = ops.logical_not(
+                    ops.logical_or(ops.isinf(shift), ops.isnan(shift))
+                )
+                # The correction takes on the rounding of every deviation d,
+                # which is far below the mean's own where the deviations are
+                # small against the values (a constant rdim, 1000 + 0.01x), and
+                # above it where the mean is small against their spread: on
+                # log-uniform values of both signs over 19 decades, rdims of
+                # 3072, the corrected mean is 6.1 ulp off and the plain one 1.2
+                # (a float32 model of the block sums; normalized outputs 10.0
+                # ulp against eager's 2.97 in the sweep). So it corrects only
+                # where the values' spread is no more than their mean, as
+                # mean((x * s) ** 2) <= 2 * mean(x * s) ** 2 tells (the mean
+                # square is the spread plus the mean squared): the model's
+                # normal, uniform, outlier and zero-sum rdims keep the plain
+                # mean, its offset, mean-3 and constant ones the corrected one.
+                # The squares are of x * s and need nothing of the first sum: a
+                # test of the deviations' own spread, sum(d * d), would wait
+                # for the mean. The test compares at the scale of the sums,
+                # sum((x * s) ** 2) <= 2 * sum(x * s) * mean(x * s), so that a
+                # constant rdim's two sides overflow together: its sum of
+                # squares is half the bound, which reaches inf first (inf
+                # against inf, or a finite sum against inf, pass), where the
+                # means' form, sum((x * s) ** 2) / R, overflowed before
+                # 2 * mean(x * s) ** 2 for constants between 2**70.2 and
+                # 2**75.5 over rdims of 3072 and took them the plain mean. A
+                # row whose squares and bound both overflow takes the
+                # correction whatever its spread; a wide one's m2 is inf then
+                # (sum(x ** 2) - R * mean ** 2 is past float32), so only its
+                # mean can move, by the rounding of its deviations.
+                assert squares is not None and bound is not None
+                narrow = ops.le(squares, bound)
+                corrected_mean = ops.add(mean, ops.truediv(shift, weight))
+                mean = ops.where(ops.logical_and(finite, narrow), corrected_mean, mean)
+                dev = ops.sub(value, mean)
             m2 = block_sum(ops.mul(dev, dev))
         else:
             value, part_m2, part_weight = values
