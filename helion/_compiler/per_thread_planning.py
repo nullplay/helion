@@ -887,7 +887,23 @@ def plan_per_thread_loop_strategy(
                 for grid_block_id in grid_block_ids
             )
 
-        consumed_grid_axes = grid_thread_axes(grid_ids) if is_device_loop else 0
+        # A device loop runs beside the grid tiles of its own root only: root
+        # loops never share a CTA, and the launch lays every root's grid tiles
+        # on the same axes.  Counting every root's grid axes left a device
+        # loop of a three-root kernel (a BatchNorm's statistics and normalize
+        # loops in each of three parts of a cat) no axis: it ran its whole
+        # tile in a lane loop, one thread per (x, chunk), and where one
+        # loop's stores are read back by the next the barrier pass refused
+        # the config.  The root is the first tile of the loop's path.  Where
+        # no path holds the loop (a backend without tile_loop_paths(), Metal)
+        # every root's grid axes count, as before: the count knows neither
+        # the loop's root nor the device loops around it, and an axis past
+        # the third is one a backend that does not demote extra axes cannot
+        # launch (Metal's thread_index raises there).
+        consumed_grid_axes = 0
+        if is_device_loop:
+            path = _tile_loop_path(backend.tile_loop_paths(fn), block_ids)
+            consumed_grid_axes = grid_thread_axes(path[0] if path else grid_ids)
         available_axes = max(0, 3 - reduction_axis_reserve - consumed_grid_axes)
 
         def takes_axis(i: int, threads: int) -> bool:

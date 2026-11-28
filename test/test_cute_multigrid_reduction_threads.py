@@ -587,3 +587,143 @@ def test_cuda_a_roots_second_reduction_matches_eager() -> None:
     a, b = kernel(x, w, y)
     torch.testing.assert_close(a, x.sum(-1) + w.amax(-1), rtol=1e-4, atol=1e-3)
     torch.testing.assert_close(b, y.sum(-1), rtol=1e-4, atol=1e-3)
+
+
+def _part_means(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    a = torch.empty([x.size(0)], dtype=torch.float32, device=x.device)
+    b = torch.empty([y.size(0)], dtype=torch.float32, device=y.device)
+    for tile_i in hl.tile(x.size(0)):
+        a[tile_i] = torch.mean(x[tile_i, :].to(torch.float32), dim=-1)
+    for tile_j in hl.tile(y.size(0)):
+        b[tile_j] = torch.mean(y[tile_j, :].to(torch.float32), dim=-1)
+    return a, b
+
+
+def _shared_beside_another(
+    x: torch.Tensor, w: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    a = torch.empty([x.size(0)], dtype=torch.float32, device=x.device)
+    b = torch.empty([y.size(0)], dtype=torch.float32, device=y.device)
+    for tile_i in hl.tile(x.size(0)):
+        a[tile_i] = x[tile_i, :].to(torch.float32).sum(-1) + w[tile_i, :].to(
+            torch.float32
+        ).amax(-1)
+    for tile_j in hl.tile(y.size(0)):
+        b[tile_j] = y[tile_j, :].to(torch.float32).sum(-1)
+    return a, b
+
+
+_PART_MEANS_SHAPES = [(64, 32), (3, 32)]
+_SHARED_BESIDE_SHAPES = [(64, 32), (64, 64), (3, 32)]
+
+
+def test_a_reduction_block_of_several_roots_takes_the_shared_launch() -> None:
+    """The two roots' 32-wide full slices are one block, the only reduction
+    block of each root, so it comes first in both and takes the shared
+    launch's first axis: 16 threads of two elements beside the 16-thread
+    tiles.  Counted against both roots' tiles together (16 * 4 threads,
+    although the roots never share a CTA), it kept 4 threads, each summing 8
+    elements serially, which is slower."""
+    code, counts = _render(_part_means, _PART_MEANS_SHAPES, {"block_sizes": [16, 4]})
+    assert "block=(16, 16, 1)" in code, code
+    assert counts == {1: 16}
+    assert code.count("threads_in_group=16") == 2
+
+
+def test_a_shared_reduction_block_beside_another_keeps_its_budget() -> None:
+    """Where a root also reduces over another block, the shared block's axis
+    follows that root's other reductions, which the shared launch does not
+    model: it keeps the backend's budget."""
+    code, counts = _render(
+        _shared_beside_another, _SHARED_BESIDE_SHAPES, {"block_sizes": [16, 4]}
+    )
+    assert "block=(4, 16, 1)" in code, code
+    assert counts == {1: 4, 2: 1}
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+def test_cuda_a_reduction_block_of_several_roots_matches_eager() -> None:
+    means = helion.kernel(
+        _part_means,
+        backend="cute",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[16, 4]),
+    )
+    x, y = (torch.randn(*shape, device=DEVICE) for shape in _PART_MEANS_SHAPES)
+    a, b = means(x, y)
+    torch.testing.assert_close(a, x.mean(-1), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(b, y.mean(-1), rtol=1e-5, atol=1e-6)
+    beside = helion.kernel(
+        _shared_beside_another,
+        backend="cute",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[16, 4]),
+    )
+    x, w, y = (torch.randn(*shape, device=DEVICE) for shape in _SHARED_BESIDE_SHAPES)
+    a, b = beside(x, w, y)
+    torch.testing.assert_close(a, x.sum(-1) + w.amax(-1), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(b, y.sum(-1), rtol=1e-4, atol=1e-4)
+
+
+def _three_part_centered(
+    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ox, oy, oz = torch.empty_like(x), torch.empty_like(y), torch.empty_like(z)
+    for tile_i in hl.tile(x.size(0)):
+        acc = hl.zeros([tile_i], dtype=torch.float32)
+        for tile_r in hl.tile(x.size(1)):
+            acc = acc + torch.sum(x[tile_i, tile_r].to(torch.float32), -1)
+        for tile_r in hl.tile(x.size(1)):
+            ox[tile_i, tile_r] = (x[tile_i, tile_r] - acc[:, None]).to(x.dtype)
+    for tile_j in hl.tile(y.size(0)):
+        acc = hl.zeros([tile_j], dtype=torch.float32)
+        for tile_r in hl.tile(y.size(1)):
+            acc = acc + torch.sum(y[tile_j, tile_r].to(torch.float32), -1)
+        for tile_r in hl.tile(y.size(1)):
+            oy[tile_j, tile_r] = (y[tile_j, tile_r] - acc[:, None]).to(y.dtype)
+    for tile_k in hl.tile(z.size(0)):
+        acc = hl.zeros([tile_k], dtype=torch.float32)
+        for tile_r in hl.tile(z.size(1)):
+            acc = acc + torch.sum(z[tile_k, tile_r].to(torch.float32), -1)
+        for tile_r in hl.tile(z.size(1)):
+            oz[tile_k, tile_r] = (z[tile_k, tile_r] - acc[:, None]).to(z.dtype)
+    return ox, oy, oz
+
+
+_THREE_PART_SHAPES = [(64, 3136), (32, 3136), (32, 3136)]
+_THREE_PART_CONFIG = {"block_sizes": [16] * 9}
+
+
+def test_device_loops_of_three_roots_keep_a_thread_axis() -> None:
+    """Each root's loops over r run beside that root's grid tile only, so
+    with three roots each still takes the launch's second axis.  Counted
+    against all three roots' grid axes, they were left none and walked
+    their 16-wide tiles in lane loops on one thread per tile_i row."""
+    kernel = helion.kernel(_three_part_centered, backend="cute", static_shapes=True)
+    args = tuple(
+        torch.randn(*shape, dtype=torch.bfloat16) for shape in _THREE_PART_SHAPES
+    )
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        code = cpu_bind(kernel, args).to_code(helion.Config(**_THREE_PART_CONFIG))
+    assert "block=(16, 16, 1)" in code, code
+    assert not re.search(r"for lane_\d+ in range", code), code
+    assert code.count("cute.arch.thread_idx()[1]") >= 6, code
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+def test_cuda_device_loops_of_three_roots_match_eager() -> None:
+    kernel = helion.kernel(
+        _three_part_centered,
+        backend="cute",
+        static_shapes=True,
+        config=helion.Config(**_THREE_PART_CONFIG),
+    )
+    args = [
+        torch.randn(*shape, device=DEVICE, dtype=torch.bfloat16)
+        for shape in _THREE_PART_SHAPES
+    ]
+    for out, arg in zip(kernel(*args), args, strict=True):
+        ref = arg.float() - arg.float().sum(-1, keepdim=True)
+        torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-1)
