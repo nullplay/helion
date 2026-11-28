@@ -495,23 +495,28 @@ class HelionScheduling(SIMDScheduling):
             return
         _, segments = helion_kernel.axis_segments
         store_cache = dict(helion_kernel.cse.store_cache)
-        for index, (start, _) in enumerate(segments):
+        for index, (start, end) in enumerate(segments):
             helion_kernel.cse.store_cache.clear()
             helion_kernel.cse.store_cache.update(store_cache)
-            with helion_kernel.pointwise_segment(start):
+            with helion_kernel.pointwise_segment(start, end):
                 if index == 0:
                     super()._codegen_node_schedule_body(node_schedule, kernel)
-                    continue
-                # The emitting pass of _codegen_node_schedule_body(), whose
-                # indexing pass the first segment ran.
-                with contextlib.ExitStack() as stack:
-                    for node in node_schedule:
-                        if node is DisableReduction:
-                            stack.enter_context(kernel.disable_reduction())
-                        elif node is EnableReduction:
-                            stack.close()
-                        else:
-                            node.codegen(kernel.split_and_set_ranges(node.get_ranges()))
+                else:
+                    # The emitting pass of _codegen_node_schedule_body(), whose
+                    # indexing pass the first segment ran.
+                    with contextlib.ExitStack() as stack:
+                        for node in node_schedule:
+                            if node is DisableReduction:
+                                stack.enter_context(kernel.disable_reduction())
+                            elif node is EnableReduction:
+                                stack.close()
+                            else:
+                                node.codegen(
+                                    kernel.split_and_set_ranges(node.get_ranges())
+                                )
+                if helion_kernel.segment_loops:
+                    # Its own top-level loop (HelionKernel.codegen_segment_loops()).
+                    helion_kernel.end_segment_loop(start, end)
 
     def create_kernel_choices(  # pyrefly: ignore [bad-override]
         self,
@@ -542,7 +547,7 @@ class HelionScheduling(SIMDScheduling):
             # divides again (HelionKernel.axis_split()); the probe tells.
             pointwise = not kernel_features.is_reduction()
             wide = pointwise and len(kernel.outer_axes) >= 3
-            if not (masked or wide) or kernel.rolled_reduction():
+            if not (masked or wide):
                 return [kernel]
             self.probe(kernel_features, kernel)
             final = self.with_pointwise_segments(kernel, kernel_args, kernel_kwargs)
@@ -566,12 +571,19 @@ class HelionScheduling(SIMDScheduling):
             # dim, which Helion cannot roll: x.flip(-1).sum(-1) over rdims of
             # 100000 would read each rdim as one block of 131072 lanes. Such a
             # kernel loops over the rdim, as Triton's rule has it. A gather's
-            # rdim, in1[tmp1, :], needs no rdim name and stays one block.
-            return [
-                HelionKernel(
-                    *kernel_args, **kernel_kwargs, override_persistent_reduction=False
-                )
-            ]
+            # rdim, in1[tmp1, :], needs no rdim name and stays one block. The
+            # loop probes for the segments of a pointwise axis as any loop does
+            # (HelionKernel.pointwise_segments()). DenseNet's BatchNorm over a
+            # cat of 128 + 5 * 32 channels, whose NCHW rdim of 4 * 784
+            # HelionChoices reads as one block once its normalize pass reads it
+            # again (PERSISTENT_WELFORD_RDIM), loops here and keeps one loop
+            # over its parts: it reads its rdim through r // 784 and r % 784.
+            looped_kwargs = {**kernel_kwargs, "override_persistent_reduction": False}
+            looped = HelionKernel(*kernel_args, **looped_kwargs)
+            if not masked:
+                return [looped]
+            self.probe(kernel_features, looped)
+            return [self.with_pointwise_segments(looped, kernel_args, looped_kwargs)]
         # An rdim past UNROLLED_RDIM_MAX keeps its tail in one emission over the
         # whole rdim, which Helion can roll: a segment's dim is a literal
         # (HelionKernel.rdim_code()), which it cannot.
@@ -600,9 +612,9 @@ class HelionScheduling(SIMDScheduling):
     def with_pointwise_segments(
         probe: HelionKernel, kernel_args: list[Any], kernel_kwargs: dict[str, Any]
     ) -> HelionKernel:
-        """A fresh kernel, emitted over the equal segments of the pointwise
-        axis whose cuts the `probe` saw (HelionKernel.pointwise_segments()),
-        if it saw such cuts."""
+        """A fresh kernel, emitted over the segments of the pointwise axis
+        whose cuts the `probe` saw (HelionKernel.pointwise_segments()), if it
+        saw such cuts."""
         kernel = HelionKernel(*kernel_args, **kernel_kwargs)
         if (segments := probe.pointwise_segments()) is not None:
             kernel.segment_axis(*segments)

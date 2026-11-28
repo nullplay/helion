@@ -7,6 +7,7 @@ import pytest
 import sympy
 import torch
 from torch._inductor.codegen.common import CSEVariable
+from torch._inductor.codegen.common import IndentedBuffer
 from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import FixedLayout
@@ -602,6 +603,110 @@ class TestAxisSplit(TestCase):
         )
         # The same division in a store splits.
         self.assertEqual(self.split(sizes, load, loads=[store])[0], ("z0_", 256))
+
+
+class TestSegmentLoopView(TestCase):
+    """HelionKernel.flat_subscript() in a segment's loop of its own
+    (segment_axis() with loops): the flat view starts at the index's positive
+    constant term only where it holds every element the rest of the index
+    reaches."""
+
+    def view(self, index, size):
+        """The offset of the view, of a storage of `size` elements, that
+        flat_subscript() reads at `index` in the loop of the second segment
+        of x, cut at 64 of 160 in a [4, 160] kernel over an rdim of 2048, and
+        the subscript."""
+        graph = GraphLowering(torch.fx.symbolic_trace(lambda x: x + 1))
+        with V.set_graph_handler(graph):
+            sizes = {"y": 4, "x": 160, "r0_": 2048}
+            kernel = HelionKernel(
+                sizes,
+                features=SIMDKernelFeatures(
+                    [], sympy.Integer(4 * 160), sympy.Integer(2048)
+                ),
+                override_persistent_reduction=False,
+            )
+            buffer = InputBuffer(
+                name="arg0_1",
+                layout=FixedLayout(torch.device("cuda"), torch.float32, [size], [1]),
+            )
+            kernel.segment_axis("x", [(0, 64), (64, 160)], loops=True)
+            with V.set_kernel_handler(kernel), kernel.pointwise_segment(64, 160):
+                arg, coordinates, _ = kernel.flat_subscript(
+                    buffer, index(**kernel.symbols), list(sizes)
+                )
+        return arg.operand.get_layout().offset, coordinates[0]
+
+    def test_view_from_the_segment_start(self):
+        # The second segment's part of a [4, 160, 2048] storage, 64 x of 2048
+        # elements in: 131072 + 2048*x + ... reads a view at 131072.
+        part = lambda y, x, r0_: 131072 + 2048 * x + 327680 * y + r0_  # noqa: E731
+        offset, subscript = self.view(part, 4 * 160 * 2048)
+        self.assertEqual(offset, 131072)
+        self.assertNotIn("131072", subscript)
+        # A storage of a symbolic size (a dynamic dim) is not known to hold
+        # 131072 elements, where comparing them crashed: the whole storage.
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        offset, subscript = self.view(part, s0)
+        self.assertEqual(offset, 0)
+        self.assertIn("131072", subscript)
+        # Nor a storage that ends at the constant: another part's load, whose
+        # mask the segment proves false.
+        self.assertEqual(self.view(part, 64 * 2048)[0], 0)
+        # A flip along x reads below its constant: 194560 - 2048*x reaches 0.
+        flip = lambda y, x, r0_: 194560 - 2048 * x + 327680 * y + r0_  # noqa: E731
+        self.assertEqual(self.view(flip, 4 * 160 * 2048)[0], 0)
+
+    def test_equal_loops_share_block_sizes(self):
+        # x cut at 64 and 96 of 128: the two loops over 32 share their blocks
+        # (y, x and the r of their loop over tile_r); the loop over 64 keeps
+        # its own.
+        graph = GraphLowering(torch.fx.symbolic_trace(lambda x: x + 1))
+        with V.set_graph_handler(graph):
+            kernel = HelionKernel(
+                {"y": 4, "x": 128, "r0_": 2048},
+                features=SIMDKernelFeatures(
+                    [], sympy.Integer(4 * 128), sympy.Integer(2048)
+                ),
+                override_persistent_reduction=False,
+            )
+            kernel.segment_axis("x", [(0, 64), (64, 96), (96, 128)], loops=True)
+            with V.set_kernel_handler(kernel):
+                self.assertIsNone(kernel.shared_segment_blocks(64))
+                self.assertEqual(
+                    kernel.shared_segment_blocks(32),
+                    {"y": "block_y0", "x": "block_x0", "r0_": "block_r0"},
+                )
+
+    def test_shared_loops_keep_a_block_per_pass(self):
+        # A reduction a later pass reads again loops over tile_r once per pass:
+        # the loops of the two segments of 32 share a block per pass, block_r0
+        # and then block_r0_1, and the loop over 64 keeps its own.
+        graph = GraphLowering(torch.fx.symbolic_trace(lambda x: x + 1))
+        with V.set_graph_handler(graph):
+            kernel = HelionKernel(
+                {"y": 4, "x": 128, "r0_": 2048},
+                features=SIMDKernelFeatures(
+                    [], sympy.Integer(4 * 128), sympy.Integer(2048)
+                ),
+                override_persistent_reduction=False,
+            )
+            segments = [(0, 64), (64, 96), (96, 128)]
+            kernel.segment_axis("x", segments, loops=True)
+            with V.set_kernel_handler(kernel):
+                for start, end in segments:
+                    with kernel.pointwise_segment(start, end):
+                        for index in range(2):
+                            kernel.loads.writeline(f"tmp{index} = {index}")
+                            kernel.codegen_body()
+                        kernel.end_segment_loop(start, end)
+                code = IndentedBuffer()
+                kernel.codegen_segment_loops(code)
+        source = code.getvalue()
+        for name in ("block_r0", "block_r0_1"):
+            self.assertIn(f"{name} = hl.register_block_size(2048)", source)
+            self.assertEqual(source.count(f"block_size={name})"), 2)
+        self.assertEqual(source.count("for tile_r in hl.tile(2048):"), 2)
 
 
 class TestPersistentLoad(TestCase):

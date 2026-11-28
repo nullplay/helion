@@ -640,8 +640,9 @@ def segments_masked_parts(node: BaseSchedulerNode) -> bool:
     masked loads keep their masks in a kernel of their own too."""
     members = node.get_nodes()
     if any(sn.is_reduction() for sn in members):
-        # A group that holds a reduction shares the first kernel's chunks,
-        # past UNROLLED_RDIM_MAX, where no reduction kernel emits segments.
+        # A group that holds a reduction is no pointwise kernel: whether its
+        # cat fuses into a reduction that loops is masked_into_looped_split()'s
+        # call.
         return False
     cats = [sn for sn in members if masked_loads(sn)]
     if len(cats) != 1:
@@ -758,7 +759,10 @@ def masked_into_looped_split(
     where the layout split's first kernel had taken 24.06 us with it. A
     pad's source, or a cat of unequal parts, keeps its masked loads in a
     kernel of its own as well, and fuses: the loop then saves the pass that
-    reads its output back."""
+    reads its output back. (A looped kernel's segment loops,
+    HelionKernel.pointwise_segments(), take no rdim that an index divides or
+    that the kernel reads as runs, as the chunks and runs above are; the
+    veto does not ask for them.)"""
     # HelionChoices handles every compile once helion.inductor is imported:
     # stock Inductor keeps its fusion.
     device = node1.get_device()

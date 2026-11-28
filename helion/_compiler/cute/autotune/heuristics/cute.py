@@ -4317,10 +4317,13 @@ class CuteSegmentRootRowHeuristic(AutotunerHeuristic):
 
     helion.inductor emits a reduction over a cat's parts along a pointwise
     axis as one root per part (segment loops), as DenseNet's BatchNorm
-    over a cat of 64 + 5 * 32 channels. Every root's grid and loop blocks are
-    config entries of their own: few random configs give all six roots
+    over a cat of 64 + 5 * 32 channels. The roots' grid and loop blocks are
+    config entries of their own, shared by the roots over parts of one
+    length (that kernel's six roots have 6 block sizes, 3 for the part of 64
+    and 3 for the five of 32): few random configs give all six roots
     layouts that compile together (1 of 20 random configs of that kernel
-    renders), and no other heuristic seeds the kernel. Every root gets the
+    rendered, measured before the roots of one length shared their blocks),
+    and no other heuristic seeds the kernel. Every root gets the
     same row config instead: one row per CTA (a grid tile of 1 on every grid
     axis) and the rounded row as one chunk or two, a packet per thread,
     strided lanes. That kernel runs 4.33 us at the two-chunk seed, where

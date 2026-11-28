@@ -784,12 +784,18 @@ def check_channel_cat_segments(test: InductorBackendTestCase, backend: str) -> N
     test.assertNotIn("hl.tile([1024, 1])", source)
 
 
-def check_cat_spans(test: InductorBackendTestCase, backend: str) -> None:
-    """ViT's LayerNorm of cat([cls, patches], 1): a persistent rdim of 96
-    over x, cut at 1 of 65. The patches are a bf16 view of a channels-last
-    image, which the one loop over the cat reads as spans of 96
-    (HelionKernel.span_subscript()): in1[span, :] with the span computed
-    from tile_y and tile_x, where the flat index read one element a lane."""
+def check_unequal_cat_segment_loops(
+    test: InductorBackendTestCase, backend: str
+) -> None:
+    """A reduction that loops over tile_r, over a cat whose parts cut a
+    pointwise axis unequally, is emitted as one top-level loop per part
+    (HelionKernel.segment_axis() with loops), each reading its part as a view,
+    where one loop over the whole axis loaded every part behind a mask and
+    selected between them. A persistent rdim keeps one loop, which reads each
+    part's rdims as spans, and so does an rdim that an index divides."""
+    # ViT's LayerNorm of cat([cls, patches], 1): a persistent rdim of 96 over
+    # x cut at 1 of 65; the patches are a bf16 view of a channels-last image,
+    # read in the one loop as spans of 96 (span_subscript()).
     cls = torch.randn(1, 1, 96, device=DEVICE, dtype=torch.bfloat16)
     image = torch.randn(4, 96, 8, 8, device=DEVICE, dtype=torch.bfloat16)
     image = image.to(memory_format=torch.channels_last)
@@ -805,6 +811,85 @@ def check_cat_spans(test: InductorBackendTestCase, backend: str) -> None:
     test.assertRegex(
         source, r"hl\.load\(in\d, \[\(-1\) \+ tile_x\.index .*, slice\(None\)\]"
     )
+    # DenseNet's BatchNorm statistics over a cat of 64 + 32 channels, NCHW
+    # bf16, split into partials per image (HelionChoices.layout_split()):
+    # the partials loop over each image's 3136 pixels, one loop per part,
+    # each reading its part as a view.
+    parts = [
+        torch.randn(4, 64, 56, 56, device=DEVICE, dtype=torch.bfloat16),
+        torch.randn(4, 32, 56, 56, device=DEVICE, dtype=torch.bfloat16),
+    ]
+
+    def stats(a, b):
+        return torch.var_mean(torch.cat([a, b], 1), [0, 2, 3], correction=0)
+
+    sources = test.compile(stats, *parts, tol=1e-2, backend=backend)
+    (source,) = [s for s in sources if "hl.tile([4, 64])" in s]
+    test.assertIn("for tile_y, tile_x in hl.tile([4, 32]):", source)
+    test.assertEqual(source.count("for tile_r in hl.tile(3136):"), 2)
+    test.assertRegex(source, r"in\d\[tile_y, tile_x, tile_r\]")
+    # Over 64 + 32 + 32 channels the two loops over 32 share their blocks
+    # (HelionKernel.shared_segment_blocks()); the loop over 64 keeps its own.
+    parts.append(torch.randn(4, 32, 56, 56, device=DEVICE, dtype=torch.bfloat16))
+    sources = test.compile(
+        lambda a, b, c: torch.var_mean(torch.cat([a, b, c], 1), [0, 2, 3]),
+        *parts,
+        tol=1e-2,
+        backend=backend,
+    )
+    (source,) = [s for s in sources if "hl.tile([4, 64])" in s]
+    test.assertIn("block_x0 = hl.register_block_size(32)", source)
+    test.assertEqual(
+        source.count("hl.tile([4, 32], block_size=[block_y0, block_x0])"), 2
+    )
+    test.assertEqual(source.count("hl.tile(3136, block_size=block_r0)"), 2)
+    # Unsplit (training, running statistics updated in place) over a cat of
+    # 16 + 8 channels: its rdim of N * H * W = 3136 per channel reads each
+    # image's run through r // 784 and r % 784, so the parts' loops would
+    # read them flat too, and the kernel keeps one loop over the channels.
+    parts = [
+        torch.randn(4, 16, 28, 28, device=DEVICE, dtype=torch.float64),
+        torch.randn(4, 8, 28, 28, device=DEVICE, dtype=torch.float64),
+    ]
+    mean, var = torch.zeros(24, device=DEVICE), torch.ones(24, device=DEVICE)
+    weight, bias = torch.randn(24, device=DEVICE), torch.randn(24, device=DEVICE)
+
+    def densenet(a, b, mean, var, weight, bias):
+        x = torch.cat([a, b], 1).float()
+        y = torch.nn.functional.batch_norm(x, mean, var, weight, bias, True, 0.1)
+        return torch.relu(y), mean, var
+
+    expected = densenet(*parts, mean.clone(), var.clone(), weight, bias)
+    sources = test.compile(
+        densenet,
+        *parts,
+        mean,
+        var,
+        weight,
+        bias,
+        expected=expected,
+        tol=1e-4,
+        backend=backend,
+    )
+    (source,) = [s for s in sources if "hl.tile(24)" in s]
+    test.assertEqual(source.count("for tile_r in hl.tile(3136):"), 2)
+    # A pointwise kernel keeps one tile over its unequal parts: a part of 3
+    # along the stride-1 dim would be a strided run of 3 per y.
+    a = torch.randn(64, 3, device=DEVICE)
+    c = torch.randn(64, 61, device=DEVICE)
+    (source,) = test.compile(
+        lambda a, c: torch.cat([a, c], 1) * 2, a, c, backend=backend
+    )
+    test.assertNotIn("hl.tile([64, 3])", source)
+    # So does an outer reduction, whose x is the stride-1 dim, over a y long
+    # enough that its partial sums loop over tile_r (reads_strided_rdim()).
+    a = torch.randn(2048, 3, device=DEVICE)
+    c = torch.randn(2048, 61, device=DEVICE)
+    sources = test.compile(
+        lambda a, c: torch.cat([a, c], 1).sum(0), a, c, tol=1e-4, backend=backend
+    )
+    (source,) = [s for s in sources if "for tile_r in hl.tile(" in s]
+    test.assertIsNone(re.search(r"hl\.tile\(\[\d+, 3\]\)", source))
 
 
 def check_window_spans(test: InductorBackendTestCase, backend: str) -> None:
@@ -1266,8 +1351,8 @@ class TestInductorCute(InductorBackendTestCase):
     def test_channel_cat_segments(self):
         check_channel_cat_segments(self, "cute")
 
-    def test_cat_spans(self):
-        check_cat_spans(self, "cute")
+    def test_unequal_cat_segment_loops(self):
+        check_unequal_cat_segment_loops(self, "cute")
 
     def test_short_rdims_stay_unsplit(self):
         # 1.6M values over rdims of 1568, which the CuTe backend's unsplit
@@ -3645,8 +3730,8 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
     def test_channel_cat_segments(self):
         check_channel_cat_segments(self, "triton")
 
-    def test_cat_spans(self):
-        check_cat_spans(self, "triton")
+    def test_unequal_cat_segment_loops(self):
+        check_unequal_cat_segment_loops(self, "triton")
 
     def test_window_spans(self):
         check_window_spans(self, "triton")
