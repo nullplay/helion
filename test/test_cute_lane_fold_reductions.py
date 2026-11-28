@@ -32,6 +32,10 @@ from helion._testing import code_and_output
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing.cute_batch_norm import BATCH_NORM_LANES_CONFIG
+from helion._testing.cute_batch_norm import batch_norm_inputs
+from helion._testing.cute_batch_norm import batch_norm_reference
+from helion._testing.cute_batch_norm import batch_norm_training
 from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
 
@@ -1069,3 +1073,26 @@ class TestCuteLaneFoldReductionsCuda(TestCase):
             loop = _device_loop_body(code)
             self.assertEqual(loop.count(REDUCE), 2)
             self.assertEqual("_fold_parts_" in loop, block_n > 2048)
+
+
+@onlyBackends(["cute"])
+@skipIfRefEager("runs the kernel")
+@pytest.mark.parametrize("threads", [64, 128, 256])
+def test_guarded_packet_lanes_fold_matches(threads: int) -> None:
+    torch.manual_seed(0)
+    inputs = batch_norm_inputs(DEVICE)
+    expected = batch_norm_reference(inputs)
+    code_and_output(
+        batch_norm_training,
+        inputs,
+        **{**BATCH_NORM_LANES_CONFIG, "num_threads": [1, threads, threads]},
+    )
+    names = ("in0", "in1", "in2", "in3", "in4", "in5", "out0", "out1", "out2")
+    got = dict(zip(names, inputs, strict=True))
+    for name in ("out0", "out1", "in1", "in2"):
+        torch.testing.assert_close(
+            got[name].double(), expected[name], rtol=1e-4, atol=1e-5
+        )
+    torch.testing.assert_close(
+        got["out2"].double(), expected["out2"], rtol=1e-2, atol=2e-2
+    )

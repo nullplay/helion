@@ -381,12 +381,24 @@ def _pure_target(target: ast.expr, caches: frozenset[str]) -> bool:
     )
 
 
+def _exits_lane(node: ast.AST) -> bool:
+    """Whether a ``break`` or ``continue`` in ``node`` leaves the lane loop
+    that holds it (not only a loop nested in ``node``)."""
+    if isinstance(node, (ast.Break, ast.Continue)):
+        return True
+    if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+        return any(_exits_lane(child) for child in node.orelse)
+    return any(_exits_lane(child) for child in ast.iter_child_nodes(node))
+
+
 def _is_pure(stmt: ast.AST, caches: frozenset[str] = frozenset()) -> bool:
     """Register arithmetic, casts, packet reads and loads only, stored to
     names or to the register caches in ``caches``."""
     from ._ast_pass_utils import _is_proven_relocatable_call
 
-    if not isinstance(stmt, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.For)):
+    if not isinstance(
+        stmt, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.For, ast.If)
+    ):
         return False
     iterators = {
         id(node.iter)
@@ -408,9 +420,16 @@ def _is_pure(stmt: ast.AST, caches: frozenset[str] = frozenset()) -> bool:
         elif isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.For)):
             if not _pure_target(node.target, caches):
                 return False
-        elif isinstance(node, (ast.Yield, ast.YieldFrom, ast.Await, ast.Delete)):
+        elif isinstance(
+            node,
+            (ast.Yield, ast.YieldFrom, ast.Await, ast.Delete, ast.Return, ast.Raise),
+        ):
             return False
-    return True
+    # An ``if`` may hold an early exit of the lane loop, which the fold's split
+    # lane loops cannot repeat per lane; one inside a loop nested in the
+    # statement (a V-loop) ends only that loop, unless it sits in that loop's
+    # ``else``.
+    return not _exits_lane(stmt)
 
 
 def _combine(op: str, dtype: str, a: str, b: str) -> str:
