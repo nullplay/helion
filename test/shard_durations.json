@@ -250,6 +250,7 @@
  "test/test_cute_numeric_extrema.py": 0.9,
  "test/test_cute_nvfp4_gemv.py": 2.3,
  "test/test_cute_nvfp4_n64.py": 2.9,
+ "test/test_cute_one_trip_packets_gpu.py": 28.6,
  "test/test_cute_online_to_3pass.py": 5.3,
  "test/test_cute_operand_multiwarp.py": 1.7,
  "test/test_cute_operand_pipeline.py": 8.6,

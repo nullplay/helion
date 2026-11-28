@@ -86,6 +86,7 @@ DEVICE_BODY_PASS_NAMES = [
     "hoist_exact_invariant_divisions",
     "cut_carried_values",
     "jam_grid_lanes",
+    "issue_packets_first",
 ]
 
 KERNEL_DEF_PASS_NAMES = [
