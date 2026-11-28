@@ -51,6 +51,8 @@ if TYPE_CHECKING:
 _LOAD_MARKER = PERSISTENT_BRANCH_VEC_LOAD
 _STORE_MARKER = PERSISTENT_BRANCH_VEC_STORE
 _SYNTHETIC_LANE_RE = re.compile(r"synthetic_lane_(\d+)")
+# The integer remainder the printer emits for an index's ``%``.
+_PYTHON_MOD = "_cute_python_mod"
 _DTYPE_INFO = {
     "cutlass.BFloat16": ("cutlass.Uint16", 2, "_cute_store_u16_vec"),
     "cutlass.Float16": ("cutlass.Uint16", 2, "_cute_store_u16_vec"),
@@ -637,13 +639,19 @@ def _lane_scale_value(
 
 
 def _scalar_pointer_calls_are_known(node: ast.AST) -> bool:
-    """Whether every call has transparent integer-coordinate semantics."""
+    """Whether every call has transparent integer-coordinate semantics: the
+    casts, the coordinates and ``_cute_python_mod`` (an integer remainder,
+    as the printer emits a flat index's ``i % d``)."""
     for child in ast.walk(node):
         if not isinstance(child, ast.Call):
             continue
         name = ast.unparse(child.func)
         if name in ("cutlass.Int32", "cutlass.Int64"):
             if len(child.args) != 1 or child.keywords:
+                return False
+            continue
+        if name == _PYTHON_MOD:
+            if len(child.args) != 2 or child.keywords:
                 return False
             continue
         if name in (
@@ -847,8 +855,11 @@ def _pointer_integer_affine_form(
     and exact tensor strides.  Lane-independent coordinates need not be equal
     at two accesses: retaining them as opaque integer atoms lets the caller
     prove that every possible base difference is a multiple of a safe row
-    stride.  Unknown tensor strides and lane-dependent nonlinear expressions
-    fail closed.
+    stride.  A product of lane-independent coordinates is such an atom too
+    (an NCHW index's ``(i // HW) * (C * HW)`` once ``i`` divides its lane
+    base, its factors names bound outside the loop).  Unknown tensor strides,
+    alone or in a product, and lane-dependent nonlinear expressions fail
+    closed.
     """
 
     def add_forms(
@@ -930,7 +941,17 @@ def _pointer_integer_affine_form(
                 if right_constant is not None:
                     left = visit(expr.left)
                     return None if left is None else scale_form(left, right_constant)
-                return None
+                # A product of two coordinates is an atom when it does not
+                # read the lane (an NCHW index's ``(i // HW) * (C * HW)``
+                # after ``i`` divides its lane base), else nonlinear.  A
+                # stride the binding does not prove fails closed in it too.
+                if any(
+                    (stride := _tensor_stride_reference(sub)) is not None
+                    and stride not in proven_tensor_stride_values
+                    for sub in ast.walk(expr)
+                ):
+                    return None
+                return opaque_atom(expr)
             left = visit(expr.left)
             right = visit(expr.right)
             if left is None or right is None:
