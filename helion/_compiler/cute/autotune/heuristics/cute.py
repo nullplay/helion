@@ -6961,7 +6961,17 @@ class CuteRolledRowLoadsFirstHeuristic(AutotunerHeuristic):
         under ``cute_proven_bounds``: its complete chunks then run apart and
         lose their bounds predicates (``peel_partial_chunks``), 21.25 instead
         of 24.6 instructions per element in BERT's folded cross-entropy
-        backward (30522 = 14 * 2048 + 1850)."""
+        backward (30522 = 14 * 2048 + 1850).
+
+        A row shorter than the chunk also gets the seed with the chunk of the
+        row's own power of two, one trip of the rolled loop: the seed's chunk
+        normalizes such a row to a persistent one, which a kernel that
+        updates a buffer in place behind its reduction (a BatchNorm's running
+        statistics) cannot lower at one row per CTA, and the rolled trip
+        can. A BatchNorm over an NCHW [8, 2048, 7, 7] bf16 image (rows of
+        392 elements, better-benchmark's var_mean_0c1c9fc832f4_c99f0cec)
+        runs that seed in 4.13 us on GB300, where its other seeds take
+        8.5-10.2 us and two full searches ended at 3.90 and 4.86."""
         seed = cls.get_seed_config(env, device_ir)
         if seed is None:
             return []
@@ -6972,10 +6982,16 @@ class CuteRolledRowLoadsFirstHeuristic(AutotunerHeuristic):
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         extent = env.specialize_expr(env.block_sizes[rl_spec.block_id].numel)
         chunk = cast("list[int]", seed.config["reduction_loops"])[0]
+        if not isinstance(extent, (int, sympy.Integer)):
+            return [seed]
+        if int(extent) < chunk:
+            trip = next_power_of_2(int(extent))
+            if trip == chunk:
+                return [seed]
+            return [seed, Config.from_dict({**seed.config, "reduction_loops": [trip]})]
         if (
             not spec.cute_proven_bounds_enabled
-            or not isinstance(extent, (int, sympy.Integer))
-            or int(extent) <= chunk
+            or int(extent) == chunk
             or int(extent) % chunk == 0
         ):
             return [seed]
