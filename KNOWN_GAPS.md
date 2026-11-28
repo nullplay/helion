@@ -597,3 +597,41 @@ these labelled lines.
   lanes, not to a statement; finding it takes the kernel's SASS, an
   investigation in the CuTe backend of its own.
 - Pinned by: none.
+
+## looped-welford-merge-rounding
+
+- Area: helion.inductor, a Welford that loops over its rdim
+  (`HelionKernel.welford()` with accumulators, `welford_reduce` or
+  `welford_combine`: a LayerNorm or BatchNorm whose rdim Triton's rule loops
+  over, a var_mean that only reduces, a split reduction's first kernel),
+  every backend; worst at small rdim blocks, as the CuTe default config's 16.
+  Not the reductions whose layout split HelionChoices declines although
+  they read enough values to take it (`UNSPLIT_LAYOUT`,
+  `HelionKernel.merges_carry()`), whose merges carry their rounding.
+- What is wrong: each block's (mean, m2, weight) merges into the running
+  mean as `acc + delta * share` and into the running m2 as
+  `acc_m2 + m2 + delta * delta * acc_weight * share`, each of which rounds
+  once per block. Over many blocks the roundings add up: through m2,
+  ordinary data comes out at several times eager's error; through the mean,
+  values of a large mean and a small spread normalize with errors several
+  times eager's. `torch.var_mean(x, -1, correction=0)` of a float32 randn()
+  [64, 12544] with `triton.persistent_reductions` off (784 merges of the
+  CuTe default config's blocks of 16): the variance 3.23 float32 spacings
+  off, eager 0.57. A BatchNorm over a channels-last input takes Inductor's
+  split, whose first kernel loops with these merges.
+- Since: #4491, which emitted Welford reductions as Helion.
+- Why deferred: the carries that `merges_carry()` kernels take (Kahan: two
+  more accumulators) cost occupancy where a searched config merges many
+  small blocks with few threads, each thread holding several tile_x
+  elements' accumulators in registers. On a GB300 (same process, the
+  searched configs, kernel time): better-benchmark's
+  var_mean_0e86f1318633_22c184d8 first kernel ([1, 32, 64] of 32 threads,
+  32 merges) 61.4 us plain, 102.0 with both carries, 94.6 with m2's alone;
+  var_mean_2056ae6e1995_139bf125's 33.4, 47.6 and 43.4 (13 merges);
+  var_mean_2e254a2827d8_8026229d's 59.4, 81.4 and 82.9 (25 merges). A
+  compensated merge that costs no occupancy (per-lane partial states merged
+  once after the loop) is a redesign of the looped Welford, and judging it
+  takes the var_mean groups' measurements.
+- Pinned by: test_inductor_backend.py
+  TestInductorCute.test_unsplit_layouts_carry_their_merges, whose var_mean
+  over a contiguous rdim of 12544 asserts the plain merge (no acc3).

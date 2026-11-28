@@ -394,6 +394,12 @@ RDIM_SEGMENT_MIN = 16
 # (HelionKernel.span_subscript()) must start on: the width of the widest packet
 # a lane loads.
 SPAN_ALIGNMENT = 16
+# The key of the FX node meta that marks a reduction whose layout split
+# HelionChoices.reduction_split_factor() declines although it reads enough
+# values to take it (MIN_LAYOUT_SPLIT_VALUES or more): its kernel reduces the
+# whole rdim where the split's first kernel reduced runs of it, and where it
+# loops, its Welford's merges carry their rounding (merges_carry()).
+UNSPLIT_LAYOUT = "helion_unsplit_layout"
 
 
 def as_less(relation: sympy.Rel) -> tuple[sympy.Basic, sympy.Basic, bool]:
@@ -2897,11 +2903,14 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         # own: of 100000000 and 100000008 in turn, the mean 100000004 rounds to
         # 100000000, and the deviations 0 and 8 give the variance 32, where
         # eager gives 16.
-        # The accumulators of a loop: mean, m2 and weight.
+        # The accumulators of a loop: mean, m2 and weight, and where its merges
+        # carry their rounding (merges_carry()), the roundings the last merge
+        # lost of the mean and of m2 (below).
+        carry = not self.persistent_reduction and self.merges_carry()
         accumulators = (
             None
             if self.persistent_reduction
-            else tuple(self.accumulator(0, dtype) for _ in range(3))
+            else tuple(self.accumulator(0, dtype) for _ in range(5 if carry else 3))
         )
         if reduction_type == "welford_reduce":
             (value,) = values
@@ -3123,7 +3132,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             # two-pass variance as in Triton's persistent reductions, with no
             # accumulators to combine them into.
             return mean, m2, weight
-        acc_mean, acc_m2, acc_weight = accumulators
+        acc_mean, acc_m2, acc_weight = accumulators[:3]
         # Triton's welford_combine of the accumulators and the block, with 0 for
         # the difference of two equal means, as inf - inf is nan, and for the
         # share of a new_weight of 0: a split's chunk past the end of R, as in
@@ -3137,12 +3146,73 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         share = ops.where(
             ops.eq(new_weight, zero), zero, ops.truediv(weight, new_weight)
         )
-        new_mean = ops.add(acc_mean, ops.mul(delta, share))
-        new_m2 = ops.add(
-            ops.add(acc_m2, m2),
-            ops.mul(ops.mul(delta, ops.mul(acc_weight, share)), delta),
-        )
+        if not carry:
+            new_mean = ops.add(acc_mean, ops.mul(delta, share))
+            new_m2 = ops.add(
+                ops.add(acc_m2, m2),
+                ops.mul(ops.mul(delta, ops.mul(acc_weight, share)), delta),
+            )
+            self.compute.writeline(f"{acc_mean} = {new_mean}")
+            self.compute.writeline(f"{acc_m2} = {new_m2}")
+            self.compute.writeline(f"{acc_weight} = {new_weight}")
+            return acc_mean, acc_m2, acc_weight
+        # A reduction left whole where the layout split would take it
+        # (merges_carry()) loops over the rdim that the split's first kernel
+        # reduced in runs, and each merge rounds acc_mean and acc_m2 once more:
+        # a BatchNorm's normalize, (x - mean) * rsqrt(var + 1e-5) over N, H and
+        # W of a float32 [24, 1024, 7, 7], 74 merges of 16 at the default
+        # config, came out at 795268 float32 spacings of 1000 + 0.01 * randn()
+        # (eager 229360) and its variance 1.96 off on randn() (eager 0.68). So
+        # each merge carries the rounding it lost into the next one (Kahan),
+        # the mean's in acc3 and m2's in acc4, and delta is taken from the
+        # running mean acc - acc3:
+        #     tmp21 = tmp17 + acc3                     # delta
+        #     tmp23 = tmp22 - acc3                     # the step, less what was lost
+        #     tmp24 = acc + tmp23                      # new mean
+        #     tmp30 = tmp29 - tmp23                    # its rounding
+        #     tmp31 = torch.where(tmp28, tmp30, tmp1)  # 0 where tmp24 is not finite
+        #     tmp36 = tmp35 - acc4                     # m2's step, less what was lost
+        #     tmp37 = acc1 + tmp36                     # new m2
+        #     tmp44 = torch.where(tmp41, tmp43, tmp1)  # its rounding
+        #     acc3 = tmp31
+        #     acc4 = tmp44
+        # (118178 and 0.45). A sum that is not finite carries nothing, where
+        # inf - inf would make every later merge nan. Other loops merge plain:
+        # where a searched config merges many small blocks the carries cost
+        # occupancy (KNOWN_GAPS.md, looped-welford-merge-rounding).
+        mean_carry, m2_carry = accumulators[3:]
+        delta = ops.add(delta, mean_carry)
+
+        def carried(
+            acc: CSEVariable, value: CSEVariable, carry: CSEVariable
+        ) -> tuple[CSEVariable, CSEVariable]:
+            value = ops.sub(value, carry)
+            total = ops.add(acc, value)
+            finite = ops.logical_not(ops.logical_or(ops.isinf(total), ops.isnan(total)))
+            rounding = ops.sub(ops.sub(total, acc), value)
+            return total, ops.where(finite, rounding, zero)
+
+        new_mean, mean_lost = carried(acc_mean, ops.mul(delta, share), mean_carry)
+        between = ops.mul(ops.mul(delta, ops.mul(acc_weight, share)), delta)
+        new_m2, m2_lost = carried(acc_m2, ops.add(m2, between), m2_carry)
         self.compute.writeline(f"{acc_mean} = {new_mean}")
         self.compute.writeline(f"{acc_m2} = {new_m2}")
         self.compute.writeline(f"{acc_weight} = {new_weight}")
+        self.compute.writeline(f"{mean_carry} = {mean_lost}")
+        self.compute.writeline(f"{m2_carry} = {m2_lost}")
         return acc_mean, acc_m2, acc_weight
+
+    def merges_carry(self) -> bool:
+        """Whether welford()'s merges of a loop's blocks carry the rounding
+        they lose into the next merge: for a reduction whose layout split
+        HelionChoices.reduction_split_factor() declined although it reads
+        enough values to take it (UNSPLIT_LAYOUT on its node). Its kernel
+        reduces the whole rdim in one loop, where the split's first kernel
+        reduced runs of it and its second merged their partials. Other looped
+        Welfords merge as Triton's welford_combine does (KNOWN_GAPS.md,
+        looped-welford-merge-rounding)."""
+        node = self.current_node
+        operation = None if node is None else node.node
+        return operation is not None and any(
+            origin.meta.get(UNSPLIT_LAYOUT, False) for origin in operation.get_origins()
+        )
