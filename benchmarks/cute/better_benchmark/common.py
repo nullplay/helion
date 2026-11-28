@@ -150,7 +150,7 @@ def spans_overlap(kernel_us: float, kernel_span_us: float) -> bool:
 # The Inductor compiles ``bench.py`` can time (``inductor_options``). A
 # comparison takes the fastest of those a record holds, in each process of a
 # repeated bench.
-INDUCTOR_IMPLS = ("inductor", "inductor_cd", "inductor_max")
+INDUCTOR_IMPLS = ("inductor", "inductor_cd", "inductor_cdmk", "inductor_max")
 
 
 def _merged_activity(records: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
@@ -422,6 +422,7 @@ def aggregate_bench_records(
 ALL_IMPLS = (
     "inductor",
     "inductor_cd",
+    "inductor_cdmk",
     "inductor_max",
     "oracle",
     "helion_triton",
@@ -563,8 +564,12 @@ def compile_policy(repro_id: str, shape: str) -> dict[str, Any]:
 def inductor_options(impl: str) -> dict[str, Any]:
     """The ``torch.compile`` options an Inductor implementation adds to the
     shape point's compile policy: none for ``inductor``,
-    ``coordinate_descent_tuning`` for ``inductor_cd``, and for
-    ``inductor_max`` what ``torch.compile(mode="max-autotune")`` sets, as
+    ``coordinate_descent_tuning`` for ``inductor_cd``, that and
+    ``triton.multi_kernel`` for ``inductor_cdmk`` (a reduction compiles both
+    its persistent and its looped kernel, and the first call, a warm-up
+    ahead of the timers' CUDA-graph capture, keeps the faster:
+    ``MultiKernelCall``), and for ``inductor_max`` what
+    ``torch.compile(mode="max-autotune")`` sets, as
     PyTorch lists them, without the mode's CUDA-graph wrapper
     (``triton.cudagraphs``). The wrapper replays the compiled function as a
     CUDA graph of its own, which cannot run inside the CUDA graphs the timers
@@ -579,6 +584,8 @@ def inductor_options(impl: str) -> dict[str, Any]:
         return inductor_helion_options()
     if impl == "inductor_cd":
         return {"coordinate_descent_tuning": True}
+    if impl == "inductor_cdmk":
+        return {"coordinate_descent_tuning": True, "triton.multi_kernel": 1}
     if impl == "inductor_max":
         import torch._inductor
 
@@ -605,6 +612,40 @@ def compile_inductor(
         compile_policy=compile_policy(repro_id, shape),
         **({"options": options} if options else {}),
     )
+
+
+@contextlib.contextmanager
+def multi_kernel_picks() -> Iterator[list[dict[str, Any]]]:
+    """The sub-kernel each Inductor multi-kernel (``triton.multi_kernel``,
+    ``inductor_cdmk``) keeps, as the calls in the block run it: its name,
+    its sub-kernels' names (a reduction's persistent and looped kernels) and
+    the one it picked, in the order of their first runs. A multi-kernel
+    benchmarks its sub-kernels at its first call and keeps the faster
+    (``MultiKernelCall.run``); bench.py takes the block around the warm-up
+    call ahead of the first CUDA-graph capture, where that happens."""
+    from torch._inductor.codegen.multi_kernel import MultiKernelCall
+
+    picks: list[dict[str, Any]] = []
+    run = MultiKernelCall.run
+
+    def recording(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = run(self, *args, **kwargs)
+        if not any(pick["multi_kernel"] == self.multi_kernel_name for pick in picks):
+            names = [kernel.inductor_meta.get("kernel_name") for kernel in self.kernels]
+            picks.append(
+                {
+                    "multi_kernel": self.multi_kernel_name,
+                    "kernels": names,
+                    "picked": names[self.picked_kernel],
+                }
+            )
+        return result
+
+    MultiKernelCall.run = recording  # type: ignore[method-assign]
+    try:
+        yield picks
+    finally:
+        MultiKernelCall.run = run  # type: ignore[method-assign]
 
 
 @contextlib.contextmanager
